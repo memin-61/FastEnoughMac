@@ -4,6 +4,13 @@
 #include "mcraw_local.h"
 #include "mcraw_projfs.h"
 #include "device_dokan.h"
+#ifdef __APPLE__
+#include "trash_macos.h"
+#endif
+#ifndef _WIN32
+#include "imgui_impl_opengl3.h"
+#endif
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
@@ -13,6 +20,27 @@
 #include <shobjidl.h>
 #include <shlobj.h>
 #include <wincrypt.h>
+#include <ole2.h>
+#include <shlobj.h>
+#include <shlwapi.h>
+#include <iphlpapi.h>
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "gdi32.lib")
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <ifaddrs.h>
+#include <netdb.h>
+#include <net/if.h>
+#include <fnmatch.h>
+#include <CommonCrypto/CommonDigest.h>
+#include <mach-o/dyld.h>
+#include <sys/stat.h>
+#endif
 #include <sstream>
 #include <algorithm>
 #include <ctime>
@@ -27,38 +55,269 @@
 #include <thread>
 #include <condition_variable>
 #include <deque>
-#include <ole2.h>
-#include <shlobj.h>
-#include <shlwapi.h>
 #include <nlohmann/json.hpp>
-#include <iphlpapi.h>
-#pragma comment(lib, "iphlpapi.lib")
-#pragma comment(lib, "shlwapi.lib")
-#pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "gdi32.lib")
+
+#ifndef _WIN32
+#define CP_UTF8 65001
+inline int WideCharToMultiByte(int, int, const wchar_t* ws, int wlen, char* out, int outlen, const char*, int*) {
+    if (!ws || wlen==0) return 0;
+    int len = (wlen==-1) ? (int)wcslen(ws) : wlen;
+    if (!out) return len+1;
+    for(int i=0;i<len && i<outlen;i++) out[i]=(char)ws[i];
+    if(len<outlen) out[len]=0;
+    return len;
+}
+inline int MultiByteToWideChar(int, int, const char* s, int slen, wchar_t* out, int outlen) {
+    if (!s || slen==0) return 0;
+    int len = (slen==-1) ? (int)strlen(s) : slen;
+    if (!out) return len+1;
+    for(int i=0;i<len && i<outlen;i++) out[i]=(wchar_t)(unsigned char)s[i];
+    if(len<outlen) out[len]=0;
+    return len;
+}
+#define BYTE unsigned char
+#define DWORD uint32_t
+#define HANDLE void*
+#define GENERIC_READ 0x80000000
+#define GENERIC_WRITE 0x40000000
+#define FILE_SHARE_READ 1
+#define OPEN_EXISTING 3
+#define CREATE_ALWAYS 2
+#define FILE_ATTRIBUTE_NORMAL 0x80
+#define FILE_FLAG_SEQUENTIAL_SCAN 0x08000000
+
+#define FILE_SHARE_WRITE 2
+#define MB_YESNO 0x04
+#define MB_ICONWARNING 0x30
+#define MB_ICONQUESTION 0x20
+#define IDYES 6
+#define IDNO 7
+inline int MessageBoxA(void*, const char*, const char*, int){ return IDYES; }
+struct STARTUPINFOA { int cb; void* hStdOutput; void* hStdError; void* hStdInput; DWORD dwFlags; int wShowWindow; };
+struct PROCESS_INFORMATION { void* hProcess; void* hThread; DWORD dwProcessId; DWORD dwThreadId; };
+#define STARTF_USESHOWWINDOW 1
+#define STARTF_USESTDHANDLES 1
+#define SW_HIDE 0
+#define CREATE_NO_WINDOW 0x08000000
+#define HANDLE_FLAG_INHERIT 1
+inline bool SetHandleInformation(void*, DWORD, DWORD){ return true; }
+inline bool CreatePipe(void**, void**, void*, DWORD){ return false; }
+inline bool CreateProcessA(void*, char*, void*, void*, int, DWORD, void*, void*, void*, void*){ return false; }
+inline DWORD WaitForSingleObject(void*, DWORD){ return 0; }
+inline bool GetExitCodeProcess(void*, DWORD*){ return true; }
+inline DWORD GetLastError(){ return 0; }
+using LPSTR = char*;
+using LPCSTR = const char*;
+inline DWORD GetModuleFileNameA(void*, char* buf, DWORD sz){ uint32_t s=sz; if(_NSGetExecutablePath(buf,&s)==0) return strlen(buf); return 0; }
+inline DWORD GetLogicalDriveStringsA(DWORD, char*){ return 0; }
+inline DWORD GetLogicalDrives(){ return 0; }
+#define MAX_PATH 260
+
+#define INVALID_HANDLE_VALUE ((void*)-1)
+#define TRUE 1
+#define FALSE 0
+#define FILE_BEGIN 0
+#define PRIORITY_HINT int
+struct FILE_IO_PRIORITY_HINT_INFO { int PriorityHint; };
+#define FileIoPriorityHintInfo 0
+inline bool CloseHandle(HANDLE h){ if(h && h!=INVALID_HANDLE_VALUE) fclose((FILE*)h); return true; }
+inline HANDLE CreateFileW(const wchar_t* p,DWORD a,DWORD s,void*,DWORD d,DWORD at,void*){ (void)s;(void)at; std::string sp; for(auto c=p;c&&*c;c++) sp.push_back((char)*c); const char* m="rb"; if(a&GENERIC_WRITE) m=(d==CREATE_ALWAYS)?"wb":"r+b"; FILE* f=fopen(sp.c_str(),m); return f?(HANDLE)f:INVALID_HANDLE_VALUE; }
+inline bool ReadFile(HANDLE h,void* b,DWORD r,DWORD* n,void*){ if(!h||h==INVALID_HANDLE_VALUE) return false; size_t k=fread(b,1,r,(FILE*)h); if(n) *n=(DWORD)k; return k>0; }
+inline bool WriteFile(HANDLE h,const void* b,DWORD w,DWORD* n,void*){ if(!h||h==INVALID_HANDLE_VALUE) return false; size_t k=fwrite(b,1,w,(FILE*)h); if(n) *n=(DWORD)k; return k==w; }
+inline bool SetFileInformationByHandle(HANDLE,int,void*,DWORD){return true;}
+inline bool GetFileSizeEx(HANDLE h, void* sz){ if(!h||h==INVALID_HANDLE_VALUE) return false; long cur=ftell((FILE*)h); fseek((FILE*)h,0,SEEK_END); long s=ftell((FILE*)h); fseek((FILE*)h,cur,SEEK_SET); *(long long*)sz=s; return true; }
+struct LARGE_INTEGER { long long QuadPart; };
+inline bool SetFilePointerEx(HANDLE h, LARGE_INTEGER li, void*, DWORD){ if(!h||h==INVALID_HANDLE_VALUE) return false; return fseeko((FILE*)h, (off_t)li.QuadPart, SEEK_SET)==0; }
+#define _stricmp strcasecmp
+#define _wcsicmp wcscasecmp
+#include <strings.h>
+
+#ifndef SHGetFolderPathA
+#define CSIDL_APPDATA 0x001a
+#define S_OK 0
+#define SUCCEEDED(hr) ((hr)==0)
+#define MAX_PATH 260
+inline int SHGetFolderPathA(void*, int, void*, DWORD, char* path){
+    const char* home=getenv("HOME");
+    std::string dir=std::string(home?home:"/tmp")+"/Library/Application Support/FastEnough";
+    std::filesystem::create_directories(dir);
+    strncpy(path, dir.c_str(), MAX_PATH);
+    return S_OK;
+}
+inline int SHGetFolderPathW(void*,int,void*,DWORD,wchar_t* p){ char tmp[MAX_PATH]; SHGetFolderPathA(nullptr,0,nullptr,0,tmp); for(int i=0;tmp[i];i++) p[i]=tmp[i]; p[strlen(tmp)]=0; return S_OK; }
+inline DWORD GetFileAttributesA(const char* p){ return std::filesystem::exists(p)?0: (DWORD)-1; }
+inline DWORD GetFileAttributesW(const wchar_t* p){ std::string s; for(auto c=p;c&&*c;c++) s.push_back((char)*c); return GetFileAttributesA(s.c_str()); }
+inline DWORD GetTempPathA(DWORD sz, char* buf){ const char* t=getenv("TMPDIR"); if(!t) t="/tmp"; strncpy(buf,t,sz); buf[sz-1]=0; return strlen(buf); }
+inline void GetWindowsDirectoryA(char* buf,DWORD sz){ strncpy(buf,"/System",sz); }
+inline bool CreateDirectoryA(const char* p, void*){ std::error_code ec; std::filesystem::create_directories(p,ec); return true; }
+inline bool CreateDirectoryW(const wchar_t* p, void*){ std::string s; for(auto c=p;c&&*c;c++) s.push_back((char)*c); return CreateDirectoryA(s.c_str(),nullptr); }
+#define INVALID_FILE_ATTRIBUTES ((DWORD)-1)
+
+#define SOCKET int
+#define INVALID_SOCKET -1
+#define FIONBIO 0x8004667e
+inline int ioctlsocket(int s, long cmd, unsigned long* argp){ (void)s;(void)cmd;(void)argp; return 0; }
+inline int WSAGetLastError2(){ return errno; }
+#define WSAGetLastError WSAGetLastError2
+#define WSAETIMEDOUT ETIMEDOUT
+inline int closesocket(int s){ return close(s); }
+#define THREAD_PRIORITY_BELOW_NORMAL 1
+inline void* GetCurrentThread(){ return nullptr; }
+inline bool SetThreadPriority(void*, int){ return true; }
+struct THREAD_POWER_THROTTLING_STATE { int Version; int ControlMask; int StateMask; };
+#define THREAD_POWER_THROTTLING_CURRENT_VERSION 1
+#define THREAD_POWER_THROTTLING_EXECUTION_SPEED 1
+inline bool SetThreadInformation(void*, int, void*, size_t){ return true; }
+#define ThreadPowerThrottling 0
+
+#define FILE_ATTRIBUTE_TEMPORARY 0x100
+#define FILE_FLAG_DELETE_ON_CLOSE 0x04000000
+#define ERROR_ACCESS_DENIED 5
+struct OVERLAPPED { void* hEvent; DWORD Offset; DWORD OffsetHigh; };
+inline int _wfopen_s(FILE** f, const wchar_t* path, const wchar_t* mode){
+    std::string sp, sm;
+    for(auto c=path;c&&*c;c++) sp.push_back((char)*c);
+    for(auto c=mode;c&&*c;c++) sm.push_back((char)*c);
+    *f = fopen(sp.c_str(), sm.c_str());
+    return *f ? 0 : 1;
+}
+
+
+
+#define LONGLONG long long
+#define ULONGLONG unsigned long long
+inline bool SetEndOfFile(HANDLE h){ if(!h||h==INVALID_HANDLE_VALUE) return false; fflush((FILE*)h); long pos = ftell((FILE*)h); if(pos<0) return false; return ftruncate(fileno((FILE*)h), (off_t)pos)==0; }
+inline bool FlushFileBuffers(HANDLE h){ if(!h||h==INVALID_HANDLE_VALUE) return false; return fflush((FILE*)h)==0; }
+inline DWORD GetCurrentProcessId(){ return (DWORD)getpid(); }
+inline unsigned long long GetTickCount64(){ return (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+using HINSTANCE = void*;
+using INT_PTR = long long;
+using HKEY = void*;
+#define KEY_SET_VALUE 0x0002
+inline long RegCreateKeyExA(void*, const char*, DWORD, char*, DWORD, DWORD, void*, void**, DWORD*){ return 1; }
+inline long RegSetValueExA(void*, const char*, DWORD, DWORD, const unsigned char*, DWORD){ return 1; }
+inline long RegCloseKey(void*){ return 0; }
+inline void* ShellExecuteW(void*, const wchar_t*, const wchar_t*, const wchar_t*, const wchar_t*, int){ return (void*)33; }
+inline HANDLE CreateFileA(const char* p,DWORD a,DWORD s,void*,DWORD d,DWORD at,void*){ (void)s;(void)at; const char* m="rb"; if(a&GENERIC_WRITE) m=(d==CREATE_ALWAYS)?"wb":"r+b"; FILE* f=fopen(p,m); return f?(HANDLE)f:INVALID_HANDLE_VALUE; }
+inline HANDLE CreateFileW(const char* p,DWORD a,DWORD s,void*,DWORD d,DWORD at,void*){ return CreateFileA(p,a,s,nullptr,d,at,nullptr); }
+
+#endif
+using HWND = void*;
+#define WM_CLOSE 0x0010
+#define SW_SHOWNORMAL 1
+inline bool PostMessage(void*, int, int, int){return true;}
+inline void* ShellExecuteA(void*, const char*, const char*, const char*, const char*, int){return nullptr;}
+#define HKEY_CURRENT_USER ((void*)0x80000001)
+using LSTATUS = long;
+#define RRF_RT_REG_DWORD 0x00000010
+#define ERROR_SUCCESS 0
+inline LSTATUS RegGetValueA(void*, const char*, const char*, DWORD, void*, void*, DWORD*){ return 1; }
+inline bool TerminateProcess(void*, int){return true;}
+
+
+inline int strcpy_s(char* dst, size_t sz, const char* src){ if(sz==0) return -1; strncpy(dst, src, sz); dst[sz-1]='\0'; return 0; }
+template<size_t N> inline int strcpy_s(char (&dst)[N], const char* src){ strncpy(dst, src, N); dst[N-1]='\0'; return 0; }
+inline int PathMatchSpecW(const wchar_t* n, const wchar_t* f){ std::string ns,fs; for(auto p=n;p&&*p;p++) ns.push_back((char)*p); for(auto p=f;p&&*p;p++) fs.push_back((char)*p); return fnmatch(fs.c_str(), ns.c_str(), FNM_CASEFOLD)==0 ? TRUE : FALSE; }
+#endif
+
+inline char getPanelSepChar(const FilePanel& p) {
+#ifdef _WIN32
+    return p.isAndroid ? '/' : '\\';
+#else
+    (void)p;
+    return '/';
+#endif
+}
+inline std::string getPanelSepStr(const FilePanel& p) {
+#ifdef _WIN32
+    return p.getSepStr(isAndroid);
+#else
+    (void)p;
+    return "/";
+#endif
+}
+inline char getSepChar(bool isAndroid) {
+#ifdef _WIN32
+    return isAndroid ? '/' : '\\';
+#else
+    (void)isAndroid;
+    return '/';
+#endif
+}
+inline std::string getSepStr(bool isAndroid) {
+#ifdef _WIN32
+    return getSepStr(isAndroid);
+#else
+    (void)isAndroid;
+    return "/";
+#endif
+}
+#ifdef _WIN32
+#define PC_PATH_SEP "\\"
+#define PC_SEP_CHAR '\\'
+#else
+#define PC_PATH_SEP "/"
+#define PC_SEP_CHAR '/'
+#endif
+inline std::string joinPcPath(const std::string& dir, const std::string& name) {
+#ifdef _WIN32
+    std::string sep = "\\";
+#else
+    std::string sep = "/";
+#endif
+    if (dir.empty()) return name;
+    std::string res = dir;
+    if (!res.empty() && res.back() != '/' && res.back() != '\\') res += sep;
+    res += name;
+    return res;
+}
+
+
+#ifndef REG_SZ
+#define REG_SZ 1
+#define REG_NONE 0
+#define SHCNE_ASSOCCHANGED 0x08000000
+#define SHCNF_IDLIST 0x0000
+inline void SHChangeNotify(long, unsigned int, const void*, const void*){}
+#define SW_SHOW 5
+#define FILE_ATTRIBUTE_HIDDEN 0x02
+#endif
+
 
 // Safe UTF-8 path-to-string helper (avoids ANSI code page issues with .string())
 static std::string pathToUtf8(const std::filesystem::path& p) {
+#ifdef _WIN32
     auto ws = p.wstring();
     if (ws.empty()) return {};
     int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), nullptr, 0, nullptr, nullptr);
     std::string utf8(len, '\0');
     WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), utf8.data(), len, nullptr, nullptr);
     return utf8;
+#else
+    return p.string();
+#endif
 }
 
 // UTF-8 to wide string helper for Unicode-safe Win32 API calls
 static std::wstring toWide(const std::string& utf8) {
+#ifdef _WIN32
     if (utf8.empty()) return {};
     int len = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), nullptr, 0);
     std::wstring wide(len, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), wide.data(), len);
     return wide;
+#else
+    std::wstring w; w.reserve(utf8.size()); for(unsigned char c: utf8) w.push_back((wchar_t)c); return w;
+#endif
 }
 
 // UTF-8 string to std::filesystem::path (via wide string to avoid ANSI codepage issues)
 static std::filesystem::path toFsPath(const std::string& utf8) {
+#ifdef _WIN32
     return std::filesystem::path(toWide(utf8));
+#else
+    return std::filesystem::path(utf8);
+#endif
 }
 
 static constexpr const char* kBackupArchiveReferenceSeparator = "|fezip|";
@@ -262,6 +521,7 @@ static std::string bytesToHex(const BYTE* data, DWORD len) {
 }
 
 static bool computeCompareLocalSha256(const std::string& path, std::string& outSha256, std::string& detail) {
+#ifdef _WIN32
     HANDLE hFile = CreateFileW(toWide(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                                OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) {
@@ -317,6 +577,24 @@ static bool computeCompareLocalSha256(const std::string& path, std::string& outS
     CryptDestroyHash(hash);
     CryptReleaseContext(prov, 0);
     return true;
+#else
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { detail = "Could not read local file"; return false; }
+    CC_SHA256_CTX ctx;
+    CC_SHA256_Init(&ctx);
+    const size_t bufSize = 4*1024*1024;
+    std::vector<char> buf(bufSize);
+    size_t n;
+    while ((n=fread(buf.data(),1,bufSize,f))>0) CC_SHA256_Update(&ctx, buf.data(), (CC_LONG)n);
+    if (ferror(f)) { fclose(f); detail="Could not finish local hash"; return false; }
+    fclose(f);
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Final(digest, &ctx);
+    static const char* hex="0123456789abcdef";
+    outSha256.clear(); outSha256.reserve(64);
+    for(int i=0;i<32;i++){ outSha256.push_back(hex[digest[i]>>4]); outSha256.push_back(hex[digest[i]&0x0F]); }
+    return true;
+#endif
 }
 
 static uint64_t directorySizeBytes(const std::filesystem::path& dir) {
@@ -350,6 +628,7 @@ static std::string formatBackupCreated(const std::string& created) {
 }
 
 static std::vector<DetectedNic> enumerateNics() {
+#ifdef _WIN32
     std::vector<DetectedNic> result;
     ULONG bufLen = 16384;
     std::vector<BYTE> buf(bufLen);
@@ -392,8 +671,32 @@ static std::vector<DetectedNic> enumerateNics() {
         }
     }
     return result;
+#else
+    std::vector<DetectedNic> result;
+    struct ifaddrs* ifap;
+    if (getifaddrs(&ifap) != 0) return result;
+    for (auto* ifa = ifap; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (!(ifa->ifa_flags & IFF_UP)) continue;
+        if (ifa->ifa_flags & IFF_LOOPBACK) continue;
+        sockaddr_in* sa = (sockaddr_in*)ifa->ifa_addr;
+        char ipStr[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &sa->sin_addr, ipStr, sizeof(ipStr));
+        std::string ip(ipStr);
+        if (ip == "127.0.0.1") continue;
+        DetectedNic nic;
+        nic.adapterName = ifa->ifa_name ? ifa->ifa_name : "en0";
+        nic.ipAddress = ip;
+        nic.description = nic.adapterName;
+        nic.speed = 1000ULL * 1000 * 1000; // 1 Gbps dummy
+        result.push_back(std::move(nic));
+    }
+    freeifaddrs(ifap);
+    return result;
+#endif
 }
 
+#ifdef _WIN32
 class SimpleDropSource : public IDropSource {
     LONG m_ref = 1;
 public:
@@ -1020,6 +1323,10 @@ void App::performAndroidDragOut(FilePanel* src) {
     });
     worker.detach();
 }
+#else
+void App::performOleDragDrop(const std::vector<std::string>& filePaths){ (void)filePaths; LOG_WARN("DragDrop","OLE drag not supported on macOS"); }
+void App::performAndroidDragOut(FilePanel* src){ (void)src; LOG_WARN("DragDrop","Android drag not supported on macOS"); }
+#endif
 
 // Check if a serial is a WiFi ADB connection (IP:port format like "192.168.x.x:5555")
 static bool isWifiSerial(const std::string& serial) {
@@ -1320,6 +1627,7 @@ extern HWND g_mainHwnd;
 
 // IFileOperation-based delete: recycle bin or permanent
 static bool deleteWindowsFiles(const std::vector<std::string>& paths, bool permanent, std::string& error) {
+#ifdef _WIN32
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     bool needUninit = SUCCEEDED(hr);
 
@@ -1361,6 +1669,21 @@ static bool deleteWindowsFiles(const std::vector<std::string>& paths, bool perma
         return false;
     }
     return true;
+#else
+#ifdef __APPLE__
+    if (!permanent) {
+        // macOS Trash via NSFileManager
+        extern bool trashFilesMac(const std::vector<std::string>&, std::string&);
+        return trashFilesMac(paths, error);
+    }
+#endif
+    std::error_code ec;
+    for (auto& path : paths) {
+        std::filesystem::remove_all(path, ec);
+        if (ec) { error = ec.message(); return false; }
+    }
+    return true;
+#endif
 }
 
 App::App() {
@@ -1375,7 +1698,15 @@ App::App() {
     m_secondaryChannel.setLocalPort(AFM_PORT + 2);
 
     m_leftPanel.isAndroid = false;
+#ifdef _WIN32
     m_leftPanel.currentPath = "C:\\";
+#else
+    {
+        const char* home = getenv("HOME");
+        if (home && std::filesystem::exists(home)) m_leftPanel.currentPath = home;
+        else m_leftPanel.currentPath = "/";
+    }
+#endif
     strcpy_s(m_leftPanel.pathInput, m_leftPanel.currentPath.c_str());
 
     m_rightPanel.isAndroid = true;
@@ -1865,14 +2196,14 @@ void App::render() {
             std::string name = focused->entryName(focused->focusedIndex);
             bool isDir = focused->entryIsDir(focused->focusedIndex);
             if (isDir) {
-                std::string sep = focused->isAndroid ? "/" : "\\";
+                std::string sep = getPanelSepStr(*focused);
                 std::string np = focused->currentPath;
                 appendPathSeparator(np, sep[0]);
                 np += name;
                 navigateToDirectory(*focused, np);
             } else if (endsWithCI(name, ".mcraw") && !focused->isAndroid) {
                 std::string mcrawFullPath = focused->currentPath;
-                appendPathSeparator(mcrawFullPath, '\\');
+                appendPathSeparator(mcrawFullPath, PC_SEP_CHAR);
                 mcrawFullPath += name;
                 postAsync("Mounting MCRAW...", [this, mcrawFullPath, focused]() {
                     std::string mountPath = McrawMountManager::instance().mountMcraw(mcrawFullPath);
@@ -1906,7 +2237,7 @@ void App::render() {
         FilePanel* focused = m_lastFocusedPanel;
         if (focused && !focused->isApps && !focused->isConnections && !focused->selectedIndices.empty()) {
             m_clipboardPaths.clear();
-            std::string sep = focused->isAndroid ? "/" : "\\";
+            std::string sep = getPanelSepStr(*focused);
             for (int idx : focused->selectedIndices) {
                 if (!focused->validIndex(idx)) continue;
                 std::string p = focused->currentPath;
@@ -1925,7 +2256,7 @@ void App::render() {
         FilePanel* focused = m_lastFocusedPanel;
         if (focused && !focused->isApps && !focused->isConnections && !focused->selectedIndices.empty()) {
             m_clipboardPaths.clear();
-            std::string sep = focused->isAndroid ? "/" : "\\";
+            std::string sep = getPanelSepStr(*focused);
             for (int idx : focused->selectedIndices) {
                 if (!focused->validIndex(idx)) continue;
                 std::string p = focused->currentPath;
@@ -2763,8 +3094,13 @@ void App::renderMenuBar() {
         }
 
         float tw = ImGui::CalcTextSize("Fast Enough? - Android File Explorer").x;
-        ImGui::SetCursorPosX((ImGui::GetWindowWidth() - tw) * 0.5f);
-        ImGui::TextColored(ImVec4(0.5f,0.7f,1,1), "Fast Enough? - Android File Explorer");
+        float curX = ImGui::GetCursorPosX();
+        // Right-align title to avoid overlapping left menus (mac has extra Backup Manager)
+        float rightX = ImGui::GetWindowWidth() - tw - 12.0f;
+        if (rightX > curX + 12.0f) {
+            ImGui::SetCursorPosX(rightX);
+            ImGui::TextColored(ImVec4(0.5f,0.7f,1,1), "Fast Enough? - Android File Explorer");
+        }
         ImGui::EndMenuBar();
     }
 }
@@ -2964,7 +3300,7 @@ std::string App::favoriteLabelForPath(const std::string& path, bool isAndroid) {
     std::string trimmed = path;
     while (trimmed.size() > 1 && (lastCharOr(trimmed) == '/' || lastCharOr(trimmed) == '\\')) trimmed.pop_back();
     if (!isAndroid && trimmed.size() == 2 && trimmed[1] == ':') return trimmed + "\\";
-    size_t pos = trimmed.find_last_of(isAndroid ? "/" : "\\");
+    size_t pos = trimmed.find_last_of(getSepStr(isAndroid));
     if (pos == std::string::npos) return trimmed;
     std::string label = trimmed.substr(pos + 1);
     if (label.empty()) return isAndroid ? "/" : trimmed;
@@ -3059,7 +3395,7 @@ void App::renderFavoritesBar(FilePanel& panel, PanelSide side) {
 std::string App::compareEntryPath(const FilePanel& panel, int index) const {
     if (panel.isApps) return panel.entryName(index);
     std::string path = panel.currentPath;
-    char sep = panel.isAndroid ? '/' : '\\';
+    char sep = getPanelSepChar(panel);
     appendPathSeparator(path, sep);
     path += panel.entryName(index);
     return path;
@@ -4363,7 +4699,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
 
     // Breadcrumb path — clickable segments
     {
-        char sep = panel.isAndroid ? '/' : '\\';
+        char sep = getPanelSepChar(panel);
         std::string path = panel.currentPath;
         std::vector<std::pair<std::string, std::string>> crumbs; // {segment, full path}
 
@@ -4386,6 +4722,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                 pos = next + 1;
             }
         } else {
+#ifdef _WIN32
             // Windows: "C:\Users\Foo" -> ["C:\", "Users", "Foo"]
             if (path.size() >= 2 && path[1] == ':') {
                 std::string root = path.substr(0, 3); // "C:\"
@@ -4399,12 +4736,32 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                 if (next == std::string::npos) next = path.size();
                 std::string seg = path.substr(pos, next - pos);
                 if (!seg.empty()) {
-                    appendPathSeparator(accum, '\\');
+                    appendPathSeparator(accum, PC_SEP_CHAR);
                     accum += seg;
                     crumbs.push_back({seg, accum});
                 }
                 pos = next + 1;
             }
+#else
+            // macOS/Linux: "/Users/foo" -> ["/", "Users", "foo"]
+            if (!path.empty() && path[0] == '/') {
+                crumbs.push_back({"/", "/"});
+                path = path.substr(1);
+            }
+            std::string accum = "/";
+            size_t pos = 0;
+            while (pos < path.size()) {
+                size_t next = path.find('/', pos);
+                if (next == std::string::npos) next = path.size();
+                std::string seg = path.substr(pos, next - pos);
+                if (!seg.empty()) {
+                    if (accum != "/") accum += "/";
+                    accum += seg;
+                    crumbs.push_back({seg, accum});
+                }
+                pos = next + 1;
+            }
+#endif
         }
 
         for (size_t ci = 0; ci < crumbs.size(); ci++) {
@@ -4442,7 +4799,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
     }
 
     if (!panel.isAndroid) {
-        for (const auto& d : getWindowsDrives()) { if (modernSmallButton(d.c_str())) navigateToDirectory(panel, d + "\\"); ImGui::SameLine(); }
+        for (const auto& d : getWindowsDrives()) { if (modernSmallButton(d.c_str())) navigateToDirectory(panel, d + PC_PATH_SEP); ImGui::SameLine(); }
         ImGui::NewLine();
     } else {
         // Dynamic bookmarks based on detected storage
@@ -4620,7 +4977,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
 
                 if (ImGui::IsMouseDoubleClicked(0)) {
                     if (isDir) {
-                        std::string sep = panel.isAndroid ? "/" : "\\";
+                        std::string sep = getPanelSepStr(panel);
                         std::string np = panel.currentPath;
                         appendPathSeparator(np, sep[0]);
                         np += name;
@@ -4628,7 +4985,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                     } else if (endsWithCI(name, ".mcraw") && !panel.isAndroid) {
                         // Windows side: mount MCRAW via ProjFS and navigate to mount point
                         std::string mcrawFullPath = panel.currentPath;
-                        appendPathSeparator(mcrawFullPath, '\\');
+                        appendPathSeparator(mcrawFullPath, PC_SEP_CHAR);
                         mcrawFullPath += name;
                         FilePanel* targetPanel = &panel;
                         postAsync("Mounting MCRAW...", [this, mcrawFullPath, targetPanel]() {
@@ -4667,7 +5024,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                     } else if (!panel.isAndroid) {
                         // Open file on Windows side
                         std::string fp = panel.currentPath;
-                        appendPathSeparator(fp, '\\');
+                        appendPathSeparator(fp, PC_SEP_CHAR);
                         fp += name;
                         if (endsWithCI(name, ".apk"))
                             requestApkInstall(fp);
@@ -5968,7 +6325,7 @@ void App::refreshBackupManagerBackups() {
     if (std::filesystem::exists(jobsRoot, ec)) {
         for (auto jobIt = std::filesystem::directory_iterator(jobsRoot, ec);
              !ec && jobIt != std::filesystem::directory_iterator(); jobIt.increment(ec)) {
-            if (jobIt->is_regular_file(ec) && _wcsicmp(jobIt->path().extension().c_str(), L".zip") == 0) {
+            if (jobIt->is_regular_file(ec) && strcasecmp(jobIt->path().extension().string().c_str(), ".zip") == 0) {
                 BackupArchive archive;
                 std::string archiveError;
                 if (!archive.open(jobIt->path(), archiveError)) {
@@ -7879,7 +8236,7 @@ void App::renderBackupManagerWindow() {
             for (const auto& value : paths) {
                 ec.clear();
                 std::filesystem::path target = std::filesystem::weakly_canonical(toFsPath(value), ec);
-                if (ec || _wcsicmp(target.parent_path().c_str(), allowed.c_str()) != 0) {
+                if (ec || strcasecmp(target.parent_path().string().c_str(), allowed.string().c_str()) != 0) {
                     LOG_ERROR("BackupManager", "Refused to delete backup outside the Jobs folder: " + value);
                     continue;
                 }
@@ -10050,9 +10407,13 @@ void App::applyScale(float newScale) {
     fontCfg.PixelSnapH = true;
     fontCfg.RasterizerDensity = 1.0f;
 
+#ifdef _WIN32
     char winDir[MAX_PATH];
     GetWindowsDirectoryA(winDir, MAX_PATH);
     std::string segoeUIPath = std::string(winDir) + "\\Fonts\\segoeui.ttf";
+#else
+    std::string segoeUIPath = "/System/Library/Fonts/Helvetica.ttc";
+#endif
 
     // Include Latin, Latin Extended, Greek, Cyrillic, and common symbols
     // so non-ASCII folder/file names display correctly.
@@ -10077,9 +10438,14 @@ void App::applyScale(float newScale) {
 
     io.Fonts->Build();
 
+#ifdef _WIN32
     // Tell DX11 backend to rebuild font texture
     extern void ImGui_ImplDX11_InvalidateDeviceObjects();
     ImGui_ImplDX11_InvalidateDeviceObjects();
+#else
+    ImGui_ImplOpenGL3_DestroyFontsTexture();
+    ImGui_ImplOpenGL3_CreateFontsTexture();
+#endif
 
     // Save current colors before resetting style
     ImVec4 savedColors[ImGuiCol_COUNT];
@@ -10571,7 +10937,7 @@ void App::renderContextMenu(FilePanel& panel) {
             ImGui::Separator();
             if (ImGui::MenuItem("Open / Navigate")) {
                 if (panel.entryIsDir(m_contextIndex)) {
-                    std::string sep = panel.isAndroid ? "/" : "\\";
+                    std::string sep = getPanelSepStr(panel);
                     std::string np = panel.currentPath;
                     appendPathSeparator(np, sep[0]); np += name;
                     navigateToDirectory(panel, np);
@@ -10580,14 +10946,14 @@ void App::renderContextMenu(FilePanel& panel) {
             if (!panel.isAndroid && !panel.entryIsDir(m_contextIndex)) {
                 if (ImGui::MenuItem("Open with Default App")) {
                     std::string fp = panel.currentPath;
-                    appendPathSeparator(fp, '\\'); fp += name;
+                    appendPathSeparator(fp, PC_SEP_CHAR); fp += name;
                     ShellExecuteA(nullptr, "open", fp.c_str(), nullptr, nullptr, SW_SHOW);
                 }
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Copy", "Ctrl+C")) {
                 m_clipboardPaths.clear();
-                std::string sep = panel.isAndroid ? "/" : "\\";
+                std::string sep = getPanelSepStr(panel);
                 for (int idx : panel.selectedIndices) {
                     if (!panel.validIndex(idx)) continue;
                     std::string p = panel.currentPath;
@@ -10601,7 +10967,7 @@ void App::renderContextMenu(FilePanel& panel) {
             }
             if (ImGui::MenuItem("Cut", "Ctrl+X")) {
                 m_clipboardPaths.clear();
-                std::string sep = panel.isAndroid ? "/" : "\\";
+                std::string sep = getPanelSepStr(panel);
                 for (int idx : panel.selectedIndices) {
                     if (!panel.validIndex(idx)) continue;
                     std::string p = panel.currentPath;
@@ -10655,7 +11021,7 @@ void App::renderNewFolderPopup() {
                 std::string mkdirPath = m_contextPanel->currentPath + "/" + m_newFolderName;
                 if (m_selectedDevice >= 0) { int slot = m_contextPanel->deviceSlot; postAsync("Creating folder...", [this, mkdirPath, slot]() { deviceForSlot(slot).createDirectory(mkdirPath); }); }
             } else {
-                std::string p = m_contextPanel->currentPath; appendPathSeparator(p, '\\'); p+=m_newFolderName;
+                std::string p = m_contextPanel->currentPath; appendPathSeparator(p, PC_SEP_CHAR); p+=m_newFolderName;
                 std::filesystem::create_directories(p);
             }
             m_contextPanel->needsRefresh = true; ImGui::CloseCurrentPopup();
@@ -10711,7 +11077,7 @@ void App::renderRenamePopup() {
                         postUiMessage(std::move(message));
                     });
                 } else {
-                    std::string bp = m_contextPanel->currentPath; appendPathSeparator(bp, '\\');
+                    std::string bp = m_contextPanel->currentPath; appendPathSeparator(bp, PC_SEP_CHAR);
                     try {
                         std::filesystem::rename(toFsPath(bp+oldN), toFsPath(bp+newN));
                         m_statusMessage = "Renamed to " + newN;
@@ -10744,7 +11110,11 @@ void App::renderDeleteConfirmPopup() {
                 ImGui::Text("PERMANENTLY DELETE - This cannot be undone!");
                 ImGui::PopStyleColor();
             } else {
+#ifdef _WIN32
                 ImGui::TextColored(ImVec4(0.5f, 0.7f, 1, 1), "Move to Recycle Bin:");
+#else
+                ImGui::TextColored(ImVec4(0.5f, 0.7f, 1, 1), "Move to Trash:");
+#endif
             }
             ImGui::Spacing();
 
@@ -10764,8 +11134,13 @@ void App::renderDeleteConfirmPopup() {
 
             ImGui::Spacing();
             if (selCount > 1) {
+#ifdef _WIN32
                 ImGui::TextColored(ImVec4(1, 0.5f, 0.5f, 1), "%d items will be %s",
                     selCount, (m_deletePermanent || isAndroid) ? "permanently deleted" : "moved to Recycle Bin");
+#else
+                ImGui::TextColored(ImVec4(1, 0.5f, 0.5f, 1), "%d items will be %s",
+                    selCount, (m_deletePermanent || isAndroid) ? "permanently deleted" : "moved to Trash");
+#endif
                 ImGui::Spacing();
             }
 
@@ -10778,7 +11153,11 @@ void App::renderDeleteConfirmPopup() {
             // Delete button
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.15f, 0.15f, 1));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.2f, 0.2f, 1));
+#ifdef _WIN32
             const char* btnLabel = (m_deletePermanent || isAndroid) ? "Delete Permanently" : "Move to Recycle Bin";
+#else
+            const char* btnLabel = (m_deletePermanent || isAndroid) ? "Delete Permanently" : "Move to Trash";
+#endif
             if (modernButton(btnLabel, ImVec2(180, 0))) {
                 if (isAndroid) {
                     // Android: always permanent via server, refresh after the queued work finishes.
@@ -10818,7 +11197,7 @@ void App::renderDeleteConfirmPopup() {
                     for (int idx : m_contextPanel->selectedIndices) {
                         if (!m_contextPanel->validIndex(idx)) continue;
                         std::string p = m_contextPanel->currentPath;
-                        appendPathSeparator(p, '\\');
+                        appendPathSeparator(p, PC_SEP_CHAR);
                         p += m_contextPanel->entryName(idx);
                         paths.push_back(p);
                     }
@@ -10873,7 +11252,7 @@ void App::performClipboardPaste(FilePanel& dstPanel) {
                     auto srcPath = toFsPath(src);
                     std::string filename = pathToUtf8(srcPath.filename());
                     std::string dst = dstDir;
-                    appendPathSeparator(dst, '\\');
+                    appendPathSeparator(dst, PC_SEP_CHAR);
                     dst += filename;
                     auto dstPath = toFsPath(dst);
                     if (isCut) {
@@ -10925,7 +11304,14 @@ void App::refreshWindowsPanel(FilePanel& panel) {
     std::string mountPoint;
     if (isOwnMountedDevicePath(panel.currentPath, &mountPoint)) {
         std::string blockedPath = panel.currentPath;
+#ifdef _WIN32
         panel.currentPath = "C:\\";
+#else
+        {
+            const char* home = getenv("HOME");
+            panel.currentPath = (home && std::filesystem::exists(home)) ? home : "/";
+        }
+#endif
         strcpy_s(panel.pathInput, panel.currentPath.c_str());
         panel.navHistory.erase(std::remove_if(panel.navHistory.begin(), panel.navHistory.end(),
             [this](const std::string& value) { return isOwnMountedDevicePath(value); }), panel.navHistory.end());
@@ -11132,7 +11518,14 @@ void App::switchPanelMode(FilePanel& panel, bool toAndroid) {
     } else {
         panel.androidEntries.clear();
         panel.appEntries.clear();
+#ifdef _WIN32
         panel.currentPath = "C:\\";
+#else
+        {
+            const char* home = getenv("HOME");
+            panel.currentPath = (home && std::filesystem::exists(home)) ? home : "/";
+        }
+#endif
         strcpy_s(panel.pathInput, panel.currentPath.c_str());
         panel.needsRefresh = true;
     }
@@ -12488,7 +12881,7 @@ static void addPullDirRecursive(DeviceClient& dev, const std::string& srcDir, co
         sub.isDirectory = e.isDirectory();
         sub.fileSize = e.size;
         sub.sourcePath = srcDir + "/" + e.name;
-        sub.destPath = dstDir + "\\" + e.name;
+        sub.destPath = dstDir + PC_PATH_SEP + e.name;
         totalBytes += sub.fileSize;
         items.push_back(sub);
         if (sub.isDirectory)
@@ -12542,7 +12935,7 @@ static void buildBatchItems(FilePanel& srcPanel, FilePanel& dstPanel, bool isPul
             if (isPull) {
                 item.sourcePath = srcPanel.mcrawFilePath;
                 std::string lp = dstPanel.currentPath;
-                appendPathSeparator(lp, '\\'); lp += item.displayName;
+                appendPathSeparator(lp, PC_SEP_CHAR); lp += item.displayName;
                 item.destPath = lp;
             } else {
                 item.sourcePath = srcPanel.mcrawFilePath;
@@ -12560,11 +12953,11 @@ static void buildBatchItems(FilePanel& srcPanel, FilePanel& dstPanel, bool isPul
             appendPathSeparator(rp, '/'); rp += item.displayName;
             item.sourcePath = rp;
             std::string lp = dstPanel.currentPath;
-            appendPathSeparator(lp, '\\'); lp += item.displayName;
+            appendPathSeparator(lp, PC_SEP_CHAR); lp += item.displayName;
             item.destPath = lp;
         } else {
             std::string lp = srcPanel.currentPath;
-            appendPathSeparator(lp, '\\'); lp += item.displayName;
+            appendPathSeparator(lp, PC_SEP_CHAR); lp += item.displayName;
             item.sourcePath = lp;
             std::string rp = dstPanel.currentPath;
             appendPathSeparator(rp, '/'); rp += item.displayName;
@@ -12646,7 +13039,7 @@ static void addLocalDirRecursive(const std::string& srcDir, const std::string& d
         sub.isDirectory = entry.is_directory(ec);
         if (ec) sub.isDirectory = false;
         sub.sourcePath = pathToUtf8(entry.path());
-        sub.destPath = dstDir + "\\" + sub.displayName;
+        sub.destPath = dstDir + PC_PATH_SEP + sub.displayName;
         if (!sub.isDirectory) {
             sub.fileSize = (uint64_t)entry.file_size(ec);
             if (ec) sub.fileSize = 0;
@@ -12668,11 +13061,11 @@ static void buildLocalBatchItems(FilePanel& srcPanel, FilePanel& dstPanel,
         item.fileSize = srcPanel.entrySize(idx);
 
         std::string sp = srcPanel.currentPath;
-        appendPathSeparator(sp, '\\'); sp += item.displayName;
+        appendPathSeparator(sp, PC_SEP_CHAR); sp += item.displayName;
         item.sourcePath = sp;
 
         std::string dp = dstPanel.currentPath;
-        appendPathSeparator(dp, '\\'); dp += item.displayName;
+        appendPathSeparator(dp, PC_SEP_CHAR); dp += item.displayName;
         item.destPath = dp;
 
         if (!item.isDirectory) {
@@ -12848,7 +13241,7 @@ void App::handleExternalFileDrop(const std::vector<std::string>& paths, int mous
         } else {
             // Explorer → Windows panel: local copy
             std::string dp = target->currentPath;
-            appendPathSeparator(dp, '\\');
+            appendPathSeparator(dp, PC_SEP_CHAR);
             dp += item.displayName;
             item.destPath = dp;
             batch->isLocalCopy = true;
@@ -16037,12 +16430,25 @@ std::string App::getFileIcon(const std::string& name, bool isDir) {
 }
 
 std::vector<std::string> App::getWindowsDrives() {
+#ifdef _WIN32
     std::vector<std::string> drives;
-    DWORD mask = GetLogicalDrives();
-    for (char c='A'; c<='Z'; c++) {
-        std::string drive = std::string(1, c) + ":";
-        if ((mask & 1) && !isOwnMountedDevicePath(drive)) drives.push_back(std::move(drive));
-        mask >>= 1;
+    char driveMask[MAX_PATH];
+    if (GetLogicalDriveStringsA(MAX_PATH, driveMask) == 0) return drives;
+    for (char* p = driveMask; *p; p += strlen(p) + 1) {
+        drives.emplace_back(p);
     }
     return drives;
+#else
+    std::vector<std::string> drives;
+    drives.push_back("/");
+    const char* home = getenv("HOME");
+    if (home) drives.push_back(std::string(home));
+    drives.push_back("/tmp");
+    // Also add /Volumes entries
+    std::error_code ec;
+    for (auto& entry : std::filesystem::directory_iterator("/Volumes", ec)) {
+        if (!ec) drives.push_back(entry.path().string());
+    }
+    return drives;
+#endif
 }

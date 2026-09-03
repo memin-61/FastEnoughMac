@@ -1,11 +1,139 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "device_client.h"
 #include "app.h" // for LOG macros
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
 #include <WinSock2.h>
 #include <WS2tcpip.h>
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <errno.h>
+#include <sys/wait.h>
+#include <spawn.h>
+#include <mach-o/dyld.h>
+extern char **environ;
+#define SOCKET int
+#ifndef INVALID_SOCKET
+#define INVALID_SOCKET (-1)
+#endif
+#define closesocket close
+inline int WSAGetLastError() { return errno; }
+#ifndef WSAEWOULDBLOCK
+#define WSAEWOULDBLOCK EWOULDBLOCK
+#endif
+#ifndef SD_BOTH
+#define SD_BOTH SHUT_RDWR
+#endif
+#ifndef _stricmp
+#define _stricmp strcasecmp
+#endif
+#ifndef _wcsicmp
+#define _wcsicmp wcscasecmp
+#endif
+// ---- Windows file API shims for macOS ----
+#include <cstdio>
+#define GENERIC_WRITE 0x40000000
+#define GENERIC_READ  0x80000000
+#define FILE_SHARE_READ 1
+#define CREATE_ALWAYS 2
+#define OPEN_EXISTING 3
+#define OPEN_ALWAYS 4
+#define FILE_ATTRIBUTE_NORMAL 0x80
+#define FILE_FLAG_SEQUENTIAL_SCAN 0x08000000
+#define INVALID_HANDLE_VALUE ((void*)-1)
+#define INFINITE 0xFFFFFFFFu
+#define MAX_PATH 1024
+using HANDLE = void*;
+using DWORD = uint32_t;
+using BOOL = int;
+using LONGLONG = long long;
+using ULONGLONG = unsigned long long;
+struct LARGE_INTEGER { long long QuadPart; };
+struct FILE_IO_PRIORITY_HINT_INFO { int PriorityHint; };
+#define PRIORITY_HINT int
+#define FileIoPriorityHintInfo 0
+inline BOOL SetFileInformationByHandle(HANDLE, int, void*, DWORD) { return TRUE; }
+#ifndef TRUE
+#define TRUE 1
+#endif
+#ifndef FALSE
+#define FALSE 0
+#endif
+#define FILE_BEGIN 0
+inline std::string wstringToUtf8(const wchar_t* w) {
+    if (!w) return "";
+    std::string s;
+    while (*w) { wchar_t c = *w++; if (c < 0x80) s.push_back((char)c); else s.push_back('?'); }
+    return s;
+}
+inline HANDLE CreateFileW(const wchar_t* path, DWORD access, DWORD share, void*, DWORD disp, DWORD attr, void*) {
+    (void)share; (void)attr;
+    std::string sp = wstringToUtf8(path);
+    const char* mode = "rb";
+    if (access & GENERIC_WRITE) mode = (disp==CREATE_ALWAYS) ? "wb" : "r+b";
+    else if (access & GENERIC_READ) mode = "rb";
+    FILE* f = fopen(sp.c_str(), mode);
+    if (!f && (access & GENERIC_WRITE) && disp==CREATE_ALWAYS) f = fopen(sp.c_str(), "wb");
+    return f ? (HANDLE)f : INVALID_HANDLE_VALUE;
+}
+inline BOOL ReadFile(HANDLE h, void* buf, DWORD toRead, DWORD* read, void*) {
+    if (!h || h==INVALID_HANDLE_VALUE) return FALSE;
+    size_t r = fread(buf, 1, toRead, (FILE*)h);
+    if (read) *read = (DWORD)r;
+    return r>0 || toRead==0 ? TRUE : FALSE;
+}
+inline BOOL WriteFile(HANDLE h, const void* buf, DWORD toWrite, DWORD* written, void*) {
+    if (!h || h==INVALID_HANDLE_VALUE) return FALSE;
+    size_t w = fwrite(buf, 1, toWrite, (FILE*)h);
+    if (written) *written = (DWORD)w;
+    return w==toWrite ? TRUE : FALSE;
+}
+inline BOOL CloseHandle(HANDLE h) {
+    if (!h || h==INVALID_HANDLE_VALUE) return FALSE;
+    return fclose((FILE*)h)==0 ? TRUE : FALSE;
+}
+inline DWORD GetLastError() { return (DWORD)errno; }
+inline BOOL SetFilePointerEx(HANDLE h, LARGE_INTEGER li, void*, DWORD) { if(!h||h==INVALID_HANDLE_VALUE) return FALSE; return fseeko((FILE*)h, (off_t)li.QuadPart, SEEK_SET)==0 ? TRUE : FALSE; }
+inline BOOL SetEndOfFile(HANDLE h) { if(!h||h==INVALID_HANDLE_VALUE) return FALSE; fflush((FILE*)h); long pos = ftell((FILE*)h); if(pos<0) return FALSE; return ftruncate(fileno((FILE*)h), (off_t)pos)==0 ? TRUE : FALSE; }
+inline DWORD GetCurrentProcessId() { return (DWORD)getpid(); }
+inline uint64_t GetTickCount64() { return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+struct _SECURITY_ATTRIBUTES { int nLength; void* lpSecurityDescriptor; int bInheritHandle; };
+using SECURITY_ATTRIBUTES = _SECURITY_ATTRIBUTES;
+using STARTUPINFOA = struct { int cb; void* hStdOutput; void* hStdError; void* hStdInput; DWORD dwFlags; int wShowWindow; };
+using PROCESS_INFORMATION = struct { void* hProcess; void* hThread; DWORD dwProcessId; DWORD dwThreadId; };
+#define STARTF_USESTDHANDLES 1
+#define STARTF_USESHOWWINDOW 2
+#define SW_HIDE 0
+#define CREATE_NO_WINDOW 0x08000000
+#define HANDLE_FLAG_INHERIT 1
+inline BOOL SetHandleInformation(HANDLE, DWORD, DWORD) { return TRUE; }
+inline BOOL CreatePipe(HANDLE*, HANDLE*, void*, DWORD) { return FALSE; }
+inline BOOL CreateProcessA(void*, char*, void*, void*, BOOL, DWORD, void*, void*, void*, void*) { return FALSE; }
+inline DWORD WaitForSingleObject(void*, DWORD) { return 0; }
+inline BOOL GetExitCodeProcess(void*, DWORD* c) { if(c) *c=0; return TRUE; }
+inline BOOL TerminateProcess(void*, DWORD) { return TRUE; }
+inline void* FindResource(void*, void*, void*) { return nullptr; }
+inline DWORD SizeofResource(void*, void*) { return 0; }
+inline void* LoadResource(void*, void*) { return nullptr; }
+inline void* LockResource(void*) { return nullptr; }
+#define MAKEINTRESOURCE(x) ((void*)(uintptr_t)(x))
+#define RT_RCDATA ((void*)10)
+using HRSRC = void*;
+using HGLOBAL = void*;
+inline DWORD GetModuleFileNameA(void*, char* buf, DWORD sz) { uint32_t s=sz; if(_NSGetExecutablePath(buf,&s)==0) return strlen(buf); return 0; }
+inline DWORD GetTempPathA(DWORD sz, char* buf) { const char* t=getenv("TMPDIR"); if(!t) t="/tmp"; strncpy(buf,t,sz); return strlen(buf); }
+inline BOOL CreateDirectoryA(const char* p, void*) { std::error_code ec; std::filesystem::create_directories(p,ec); return TRUE; }
+inline void* GetCurrentProcess() { return nullptr; }
+inline BOOL GetFileSizeEx(HANDLE h, LARGE_INTEGER* sz) { if(!h||h==INVALID_HANDLE_VALUE||!sz) return FALSE; long cur=ftell((FILE*)h); fseek((FILE*)h,0,SEEK_END); long s=ftell((FILE*)h); fseek((FILE*)h,cur,SEEK_SET); sz->QuadPart=s; return TRUE; }
+#endif
 #include <sstream>
 #include <algorithm>
 #include <filesystem>
@@ -22,9 +150,12 @@
 #include <unordered_map>
 #include <nlohmann/json.hpp>
 
+#ifdef _WIN32
 #pragma comment(lib, "ws2_32.lib")
+#endif
 
 // UTF-8 to wide string helper
+#ifdef _WIN32
 static std::wstring toWide(const std::string& utf8) {
     if (utf8.empty()) return {};
     int len = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), nullptr, 0);
@@ -32,25 +163,44 @@ static std::wstring toWide(const std::string& utf8) {
     MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), wide.data(), len);
     return wide;
 }
+#else
+static std::wstring toWide(const std::string& utf8) {
+    // On POSIX, just widen via simple conversion (paths are UTF-8)
+    std::wstring w;
+    w.reserve(utf8.size());
+    for (unsigned char c : utf8) w.push_back((wchar_t)c);
+    return w;
+}
+#endif
 
 // UTF-8 string to std::filesystem::path (via wide string to avoid ANSI codepage issues)
 static std::filesystem::path toFsPath(const std::string& utf8) {
+#ifdef _WIN32
     return std::filesystem::path(toWide(utf8));
+#else
+    return std::filesystem::path(utf8);
+#endif
 }
 
 static std::string pathToUtf8(const std::filesystem::path& p) {
+#ifdef _WIN32
     auto ws = p.wstring();
     if (ws.empty()) return {};
     int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), nullptr, 0, nullptr, nullptr);
     std::string utf8(len, '\0');
     WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), utf8.data(), len, nullptr, nullptr);
     return utf8;
+#else
+    return p.string();
+#endif
 }
 
+#ifdef _WIN32
 static struct WsaInit {
     WsaInit() { WSADATA d; WSAStartup(MAKEWORD(2,2), &d); }
     ~WsaInit() { WSACleanup(); }
 } g_wsaInit;
+#endif
 
 static std::string sanitizeAdbOutput(std::string text);
 
@@ -77,6 +227,7 @@ bool DeviceClient::findAdb() {
     if (!m_adbPath.empty() && tryPath(std::filesystem::path(m_adbPath))) return true;
     m_adbPath.clear();
 
+#ifdef _WIN32
     // Check bundled ADB first.
     char exePath[MAX_PATH];
     DWORD exePathLen = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
@@ -101,9 +252,40 @@ bool DeviceClient::findAdb() {
         while (!p.empty() && (p.back() == '\r' || p.back() == '\n' || p.back() == ' ')) p.pop_back();
         if (tryPath(std::filesystem::path(p))) return true;
     }
+#else
+    // macOS / Linux: check exe dir and common SDK locations
+    char exePath[4096] = {};
+    uint32_t size = sizeof(exePath);
+    if (_NSGetExecutablePath(exePath, &size) == 0) {
+        std::filesystem::path exeDir = std::filesystem::path(exePath).parent_path();
+        if (tryPath(exeDir / "platform-tools" / "adb")) return true;
+        if (tryPath(exeDir / "adb")) return true;
+        if (tryPath(exeDir / "../platform-tools/adb")) return true;
+    }
+    if (const char* home = std::getenv("HOME")) {
+        if (tryPath(std::filesystem::path(home) / "Library" / "Android" / "sdk" / "platform-tools" / "adb")) return true;
+        if (tryPath(std::filesystem::path(home) / "Android" / "Sdk" / "platform-tools" / "adb")) return true;
+    }
+    if (const char* ah = std::getenv("ANDROID_HOME"))
+        if (tryPath(std::filesystem::path(ah) / "platform-tools" / "adb")) return true;
+    if (const char* sr = std::getenv("ANDROID_SDK_ROOT"))
+        if (tryPath(std::filesystem::path(sr) / "platform-tools" / "adb")) return true;
+    // Check PATH via which
+    std::string result = runProcess("which adb 2>/dev/null");
+    if (!result.empty()) {
+        auto pos = result.find('\n');
+        std::string p = result.substr(0, pos);
+        while (!p.empty() && (p.back() == '\r' || p.back() == '\n' || p.back() == ' ')) p.pop_back();
+        if (tryPath(std::filesystem::path(p))) return true;
+    }
+    // Homebrew
+    if (tryPath("/opt/homebrew/bin/adb")) return true;
+    if (tryPath("/usr/local/bin/adb")) return true;
+#endif
     return false;
 }
 
+#ifdef _WIN32
 std::string DeviceClient::runProcess(const std::string& command) {
     SECURITY_ATTRIBUTES sa{}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
     HANDLE hRead, hWrite;
@@ -124,7 +306,19 @@ std::string DeviceClient::runProcess(const std::string& command) {
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
     return output;
 }
+#else
+std::string DeviceClient::runProcess(const std::string& command) {
+    std::string output;
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) return "";
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), pipe)) output += buf;
+    pclose(pipe);
+    return output;
+}
+#endif
 
+#ifdef _WIN32
 static std::string lastWin32ErrorText() {
     DWORD err = GetLastError();
     if (err == 0) return "Windows process error";
@@ -136,7 +330,15 @@ static std::string lastWin32ErrorText() {
     while (!out.empty() && (out.back() == '\r' || out.back() == '\n' || out.back() == '.')) out.pop_back();
     return out;
 }
+#else
+static std::string lastWin32ErrorText() {
+    std::string out = strerror(errno);
+    if (out.empty()) out = "Process error";
+    return out;
+}
+#endif
 
+#ifdef _WIN32
 bool DeviceClient::runProcessToFile(const std::string& command, const std::string& outputPath, std::string& output,
                                     uint32_t timeoutMs, ProgressCallback progress, uint64_t totalBytes) {
     output.clear();
@@ -291,6 +493,53 @@ bool DeviceClient::runProcessFromFile(const std::string& command, const std::str
     CloseHandle(pi.hThread);
     return exitCode == 0;
 }
+#else
+bool DeviceClient::runProcessToFile(const std::string& command, const std::string& outputPath, std::string& output,
+                                    uint32_t timeoutMs, ProgressCallback progress, uint64_t totalBytes) {
+    (void)timeoutMs;
+    output.clear();
+    LOG_INFO("Process", "Streaming command output to file (POSIX): " + outputPath);
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) { output = lastWin32ErrorText(); return false; }
+    FILE* out = fopen(outputPath.c_str(), "wb");
+    if (!out) { output = "Could not create output file: " + outputPath; pclose(pipe); return false; }
+    std::vector<char> buf(1024*1024);
+    uint64_t transferred = 0;
+    size_t n;
+    while ((n = fread(buf.data(), 1, buf.size(), pipe)) > 0) {
+        if (fwrite(buf.data(), 1, n, out) != n) { output = "Write failed"; fclose(out); pclose(pipe); return false; }
+        transferred += n;
+        if (progress && !progress(transferred, totalBytes)) { output = "Operation cancelled."; fclose(out); pclose(pipe); return false; }
+    }
+    fclose(out);
+    int rc = pclose(pipe);
+    int exitCode = WIFEXITED(rc) ? WEXITSTATUS(rc) : 1;
+    if (exitCode != 0) {
+        output = "Command failed with exit code " + std::to_string(exitCode);
+        LOG_ERROR("Process", "Streaming failed for " + outputPath + ": " + output);
+        return false;
+    }
+    LOG_INFO("Process", "Streaming completed: " + outputPath);
+    return true;
+}
+
+bool DeviceClient::runProcessFromFile(const std::string& command, const std::string& inputPath, std::string& output,
+                                      uint32_t timeoutMs) {
+    (void)timeoutMs;
+    output.clear();
+    std::string full = command + " < \"" + inputPath + "\" 2>&1";
+    FILE* pipe = popen(full.c_str(), "r");
+    if (!pipe) { output = lastWin32ErrorText(); return false; }
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), pipe)) {
+        output += buf;
+        if (output.size() > 32768) output.erase(0, output.size()-32768);
+    }
+    int rc = pclose(pipe);
+    int exitCode = WIFEXITED(rc) ? WEXITSTATUS(rc) : 1;
+    return exitCode == 0;
+}
+#endif
 
 std::string DeviceClient::runAdbCommand(const std::string& args) {
     LOG_DEBUG("ADB", "$ adb " + args);
@@ -443,6 +692,7 @@ void DeviceClient::closeTrackDevices(uintptr_t sock) {
 }
 
 std::string DeviceClient::getServerBinaryPath() {
+#ifdef _WIN32
     // First check next to the exe (for development)
     char exePath[MAX_PATH];
     GetModuleFileNameA(nullptr, exePath, MAX_PATH);
@@ -487,9 +737,29 @@ std::string DeviceClient::getServerBinaryPath() {
     }
 
     return extractPath;
+#else
+    // macOS/Linux: check next to exe, then source tree, then temp
+    char exePath[4096] = {};
+    uint32_t size = sizeof(exePath);
+    if (_NSGetExecutablePath(exePath, &size) == 0) {
+        std::filesystem::path exeDir = std::filesystem::path(exePath).parent_path();
+        std::string beside = (exeDir / "afm-server").string();
+        if (std::filesystem::exists(beside)) return beside;
+        std::string alt = (exeDir / "../server/afm-server").string();
+        if (std::filesystem::exists(alt)) return std::filesystem::canonical(alt).string();
+        std::string alt2 = (exeDir / "../../server/afm-server").string();
+        if (std::filesystem::exists(alt2)) return std::filesystem::canonical(alt2).string();
+    }
+    // Check current working dir
+    if (std::filesystem::exists("server/afm-server")) return "server/afm-server";
+    if (std::filesystem::exists("/tmp/afm-server")) return "/tmp/afm-server";
+    // Fallback: extract to temp if needed (no resource on mac, just return beside)
+    return "server/afm-server";
+#endif
 }
 
 static std::string getAppLabelsDexPath() {
+#ifdef _WIN32
     char tempDir[MAX_PATH];
     GetTempPathA(MAX_PATH, tempDir);
     std::string extractDir = std::string(tempDir) + "FastEnough";
@@ -515,6 +785,19 @@ static std::string getAppLabelsDexPath() {
     bool ok = WriteFile(file, data, resourceSize, &written, nullptr) && written == resourceSize;
     CloseHandle(file);
     return ok ? extractPath : std::string{};
+#else
+    char exePath[4096] = {};
+    uint32_t size = sizeof(exePath);
+    if (_NSGetExecutablePath(exePath, &size) == 0) {
+        std::filesystem::path exeDir = std::filesystem::path(exePath).parent_path();
+        std::string p = (exeDir / "afm-labels.dex").string();
+        if (std::filesystem::exists(p)) return p;
+        p = (exeDir / "../server/afm-labels.dex").string();
+        if (std::filesystem::exists(p)) return std::filesystem::canonical(p).string();
+    }
+    if (std::filesystem::exists("server/afm-labels.dex")) return "server/afm-labels.dex";
+    return "";
+#endif
 }
 
 // Detect device's network IP for direct connection (USB tethering only)
@@ -901,7 +1184,12 @@ bool DeviceClient::installBackupApksBatch(const std::vector<std::string>& backup
         return std::all_of(installed.begin(), installed.end(), [](bool value) { return value; });
 
     std::string stagingRoot = "/data/local/tmp/afm-install-" +
-        std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64());
+#ifdef _WIN32
+        std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64())
+#else
+        std::to_string(getpid()) + "-" + std::to_string((uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count())
+#endif
+        ;
     if (!createDirectory(stagingRoot)) {
         output += "Could not create the APK staging directory: " + m_lastError;
         return false;
@@ -1758,12 +2046,17 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
             std::string launchInner = serverLaunchCommand(launchPort, m_useRoot);
             std::string cmd = "\"" + m_adbPath + "\" -s " + serial +
                 " shell \"" + launchInner + "\"";
+#ifdef _WIN32
             std::string cmdBuf = cmd;
             STARTUPINFOA si2{}; si2.cb = sizeof(si2);
             si2.dwFlags = STARTF_USESHOWWINDOW; si2.wShowWindow = SW_HIDE;
             PROCESS_INFORMATION pi2{};
             CreateProcessA(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si2, &pi2);
             if (pi2.hProcess) { WaitForSingleObject(pi2.hProcess, 3000); CloseHandle(pi2.hProcess); CloseHandle(pi2.hThread); }
+#else
+            // POSIX: run via shell, don't block on server start
+            (void)system(cmd.c_str());
+#endif
             std::this_thread::sleep_for(std::chrono::milliseconds(1500));
             LOG_INFO("Server", "Fresh server started after reconnect");
         }
@@ -1843,6 +2136,7 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
     std::string cmd = "\"" + m_adbPath + "\" -s " + serial +
         " shell \"" + launchInner + "\"";
     LOG_DEBUG("Server", "Launch cmd: " + cmd);
+#ifdef _WIN32
     STARTUPINFOA si{}; si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION pi{};
@@ -1855,6 +2149,12 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
         LOG_INFO("Server", "Server launch process wait=" + std::to_string(waitResult) + " exit=" + std::to_string(exitCode));
         CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
     }
+#else
+    {
+        int rc = system(cmd.c_str());
+        LOG_INFO("Server", "Server launch system rc=" + std::to_string(rc));
+    }
+#endif
 
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
@@ -1910,12 +2210,16 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
                     runAdbCommand("-s " + serial + " shell rm -f /data/local/tmp/afm-server.log");
                     std::string restartCmd = "\"" + m_adbPath + "\" -s " + serial +
                         " shell \"" + serverLaunchCommand(launchPort, m_useRoot) + "\"";
+#ifdef _WIN32
                     std::string restartBuf = restartCmd;
                     STARTUPINFOA rsi{}; rsi.cb = sizeof(rsi);
                     rsi.dwFlags = STARTF_USESHOWWINDOW; rsi.wShowWindow = SW_HIDE;
                     PROCESS_INFORMATION rpi{};
                     CreateProcessA(nullptr, restartBuf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &rsi, &rpi);
                     if (rpi.hProcess) { WaitForSingleObject(rpi.hProcess, 3000); CloseHandle(rpi.hProcess); CloseHandle(rpi.hThread); }
+#else
+                    (void)system(restartCmd.c_str());
+#endif
                     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
                 }
             }
@@ -2164,26 +2468,52 @@ uintptr_t DeviceClient::openServerSocket(const std::string& host, int port,
     addr.sin_port = htons((u_short)port);
     inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
 
+#ifdef _WIN32
     u_long nonBlocking = 1;
     ioctlsocket(sock, FIONBIO, &nonBlocking);
+#else
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+#endif
     int ret = connect(sock, (sockaddr*)&addr, sizeof(addr));
     if (ret != 0) {
         int err = WSAGetLastError();
+#ifdef _WIN32
         if (err != WSAEWOULDBLOCK) { closesocket(sock); return (uintptr_t)INVALID_SOCKET; }
+#else
+        if (err != EINPROGRESS && err != EWOULDBLOCK) { closesocket(sock); return (uintptr_t)INVALID_SOCKET; }
+#endif
         fd_set writeSet, exceptSet;
         FD_ZERO(&writeSet); FD_SET(sock, &writeSet);
         FD_ZERO(&exceptSet); FD_SET(sock, &exceptSet);
         timeval tv = { 5, 0 };
+#ifdef _WIN32
         int selRet = select(0, nullptr, &writeSet, &exceptSet, &tv);
+#else
+        int selRet = select(sock+1, nullptr, &writeSet, &exceptSet, &tv);
+#endif
         if (selRet <= 0 || FD_ISSET(sock, &exceptSet)) {
             closesocket(sock); return (uintptr_t)INVALID_SOCKET;
         }
-        int sockErr = 0; int optLen = sizeof(sockErr);
+        int sockErr = 0;
+#ifdef _WIN32
+        int optLen = sizeof(sockErr);
         getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&sockErr, &optLen);
+#else
+        socklen_t optLen = sizeof(sockErr);
+        getsockopt(sock, SOL_SOCKET, SO_ERROR, &sockErr, &optLen);
+#endif
         if (sockErr != 0) { closesocket(sock); return (uintptr_t)INVALID_SOCKET; }
     }
+#ifdef _WIN32
     u_long blocking = 0;
     ioctlsocket(sock, FIONBIO, &blocking);
+#else
+    {
+        int flags2 = fcntl(sock, F_GETFL, 0);
+        fcntl(sock, F_SETFL, flags2 & ~O_NONBLOCK);
+    }
+#endif
 
     DWORD sndTimeout = 30000;
     DWORD rcvTimeout = 10000;
@@ -2192,10 +2522,17 @@ uintptr_t DeviceClient::openServerSocket(const std::string& host, int port,
 
     BOOL keepAlive = TRUE;
     setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepAlive, sizeof(keepAlive));
+#ifdef _WIN32
     DWORD keepIdle = 5000, keepInterval = 1000, keepCount = 3;
     setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, (const char*)&keepIdle, sizeof(keepIdle));
     setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, (const char*)&keepInterval, sizeof(keepInterval));
     setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, (const char*)&keepCount, sizeof(keepCount));
+#else
+    int keepIdle = 5, keepInterval = 1, keepCount = 3;
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPALIVE, &keepIdle, sizeof(keepIdle));
+    // macOS does not have TCP_KEEPINTVL / TCP_KEEPCNT via setsockopt, use TCP_KEEPALIVE only
+    (void)keepInterval; (void)keepCount;
+#endif
 
     return (uintptr_t)sock;
 }

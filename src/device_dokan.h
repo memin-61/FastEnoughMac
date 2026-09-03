@@ -3,6 +3,7 @@
 #include <string>
 #include <mutex>
 #include <atomic>
+#include <thread>
 
 // Dokan virtual filesystem for Android device storage.
 // Exposes device files as a local Windows drive letter.

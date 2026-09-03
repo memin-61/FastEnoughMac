@@ -1,4 +1,9 @@
 #pragma once
+#ifdef __APPLE__
+#include <ctime>
+inline int localtime_s_compat(struct tm* tm, const time_t* t){ return localtime_r(t, tm) ? 0 : -1; }
+#define localtime_s localtime_s_compat
+#endif
 #include "device_client.h"
 #include "imgui.h"
 #include <string>
