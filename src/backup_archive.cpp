@@ -2,8 +2,15 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <ctime>
 #include <fstream>
 #include <limits>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -98,6 +105,43 @@ bool safeEntryName(const std::string& name) {
     return true;
 }
 
+// DOS date/time encoding (local time), matching the on-device zip writer.
+static void dosDateTime(int64_t unixSec, uint16_t& dosTime, uint16_t& dosDate) {
+    if (unixSec <= 0) { dosTime = 0; dosDate = 0x0021; return; }
+    time_t tt = (time_t)unixSec;
+    struct tm tmv{};
+    localtime_r(&tt, &tmv);
+    int year = tmv.tm_year + 1900;
+    if (year < 1980) { dosTime = 0; dosDate = 0x0021; return; }
+    if (year > 2107) year = 2107;
+    dosTime = (uint16_t)((tmv.tm_hour << 11) | (tmv.tm_min << 5) | (tmv.tm_sec / 2));
+    dosDate = (uint16_t)(((year - 1980) << 9) | ((tmv.tm_mon + 1) << 5) | tmv.tm_mday);
+}
+
+static int64_t dosToUnix(uint16_t dosTime, uint16_t dosDate) {
+    if (dosDate == 0) return 0;
+    struct tm tmv{};
+    tmv.tm_year = ((dosDate >> 9) & 0x7f) + 80;
+    tmv.tm_mon  = ((dosDate >> 5) & 0x0f) - 1;
+    tmv.tm_mday = (dosDate & 0x1f);
+    tmv.tm_hour = (dosTime >> 11) & 0x1f;
+    tmv.tm_min  = (dosTime >> 5) & 0x3f;
+    tmv.tm_sec  = (dosTime & 0x1f) * 2;
+    if (tmv.tm_mon < 0 || tmv.tm_mday <= 0) return 0;
+    tmv.tm_isdst = -1;
+    time_t tt = mktime(&tmv);
+    return tt < 0 ? 0 : (int64_t)tt;
+}
+
+static int64_t fileMtimeUnix(const std::filesystem::path& p) {
+    std::error_code ec;
+    auto ft = std::filesystem::last_write_time(p, ec);
+    if (ec) return 0;
+    auto sc = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+        ft - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
+    return (int64_t)std::chrono::system_clock::to_time_t(sc);
+}
+
 struct PendingEntry {
     std::filesystem::path source;
     BackupArchiveEntry entry;
@@ -160,6 +204,7 @@ bool BackupArchive::createStore(const std::filesystem::path& sourceRoot,
             error = "Could not read backup file size: " + pending.entry.name;
             return false;
         }
+        pending.entry.mtime = fileMtimeUnix(pending.source);
         files.push_back(std::move(pending));
     }
     if (ec) {
@@ -182,12 +227,14 @@ bool BackupArchive::createStore(const std::filesystem::path& sourceRoot,
     std::vector<char> buffer(1024 * 1024);
     for (auto& pending : files) {
         pending.entry.localHeaderOffset = static_cast<uint64_t>(out.tellp());
+        uint16_t dosTime = 0, dosDate = 0;
+        dosDateTime(pending.entry.mtime, dosTime, dosDate);
         put32(out, kLocalHeader);
         put16(out, 45);
         put16(out, 0x0800);
         put16(out, 0);
-        put16(out, 0);
-        put16(out, 0);
+        put16(out, dosTime);
+        put16(out, dosDate);
         put32(out, 0);
         put32(out, 0xffffffffu);
         put32(out, 0xffffffffu);
@@ -237,13 +284,15 @@ bool BackupArchive::createStore(const std::filesystem::path& sourceRoot,
 
     const uint64_t centralOffset = static_cast<uint64_t>(out.tellp());
     for (const auto& pending : files) {
+        uint16_t cTime = 0, cDate = 0;
+        dosDateTime(pending.entry.mtime, cTime, cDate);
         put32(out, kCentralHeader);
         put16(out, 45);
         put16(out, 45);
         put16(out, 0x0800);
         put16(out, 0);
-        put16(out, 0);
-        put16(out, 0);
+        put16(out, cTime);
+        put16(out, cDate);
         put32(out, pending.entry.crc32);
         put32(out, 0xffffffffu);
         put32(out, 0xffffffffu);
@@ -586,6 +635,7 @@ bool BackupArchive::open(const std::filesystem::path& archivePath, std::string& 
             m_entries.clear();
             return false;
         }
+        entry.mtime = dosToUnix(get16(local.data() + 10), get16(local.data() + 12));
         entry.dataOffset = entry.localHeaderOffset + 30 + get16(local.data() + 26) + get16(local.data() + 28);
         if (entry.dataOffset > fileSize || entry.size > fileSize - entry.dataOffset) {
             error = "Backup archive entry exceeds the file size";
@@ -697,6 +747,15 @@ bool BackupArchive::extractPrefix(const std::string& prefix,
         if ((crc ^ 0xffffffffu) != entry.crc32) {
             error = "Backup archive entry failed its integrity check: " + entry.name;
             return false;
+        }
+        out.close();
+        if (entry.mtime > 0) {
+#ifndef _WIN32
+            struct timespec ts[2];
+            ts[0].tv_sec = (time_t)entry.mtime; ts[0].tv_nsec = 0;
+            ts[1] = ts[0];
+            utimensat(AT_FDCWD, outputPath.c_str(), ts, 0);
+#endif
         }
         extractedFiles.push_back(outputPath);
     }

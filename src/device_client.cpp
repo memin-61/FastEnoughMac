@@ -3302,13 +3302,22 @@ bool DeviceClient::pushFile(const std::string& localPath, const std::string& rem
         if (!sendOk) { success = false; break; }
         sent += sendBytes;
 
+        if (!readOk) {
+            // A read error or a short read must not be reported as success: the
+            // device would keep a truncated prefix and the inline CRC would
+            // describe that same prefix, so verification would falsely MATCH.
+            success = false;
+            m_lastError = "Local read failed or file changed during push: " + localPath;
+            break;
+        }
+
         if (progress && !progress(sent, fileSize)) {
             success = false;
             m_lastError = "Cancelled";
             break;
         }
 
-        if (!hasNext || !readOk) break;
+        if (!hasNext) break;
 
         // Rotate buffers
         char* oldSendBuf = sendBuf;
@@ -3319,6 +3328,12 @@ bool DeviceClient::pushFile(const std::string& localPath, const std::string& rem
     }
 
     CloseHandle(hFile);
+
+    if (success && sent != fileSize) {
+        success = false;
+        m_lastError = "Push incomplete: sent " + std::to_string(sent) +
+                      " of " + std::to_string(fileSize) + " bytes";
+    }
 
     // Send DONE
     sendMsg(RSP_DONE);
@@ -4057,8 +4072,12 @@ bool DeviceClient::resumePullFile(const std::string& remotePath, const std::stri
         if (m_transferBuf.size() < hdr.length) m_transferBuf.resize(hdr.length);
         if (!recvAll(m_transferBuf.data(), hdr.length)) { success = false; break; }
 
-        DWORD written;
-        WriteFile(hFile, m_transferBuf.data(), hdr.length, &written, nullptr);
+        DWORD written = 0;
+        if (!WriteFile(hFile, m_transferBuf.data(), hdr.length, &written, nullptr) || written != hdr.length) {
+            success = false;
+            m_lastError = "Local write failed while resuming pull";
+            break;
+        }
         received += written;
 
         if (progress && !progress(received, outFileSize)) {

@@ -1890,6 +1890,11 @@ static void handle_push(int fd, const void* payload, uint32_t payload_len) {
         error = 1;
     async_writer_destroy(&writer);
 
+    // A short stream must never be reported as a complete file, and must not be
+    // published as the cached CRC (that made truncated pushes verify as MATCH).
+    if (!error && received != ph.file_size)
+        error = 1;
+
     fsync(file_fd);
     close(file_fd);
 
@@ -2216,6 +2221,9 @@ static void handle_write_range(int fd, const void* payload, uint32_t payload_len
     // File was pre-allocated by createFile; blocks are non-overlapping.
     close(file_fd);
 
+    if (!error && written != length)
+        error = 1;
+
     if (error) {
         send_error(fd, "Write failed");
     } else {
@@ -2405,6 +2413,9 @@ static void handle_resume_push(int fd, const void* payload, uint32_t payload_len
     free(buf_b);
     fsync(file_fd);
     close(file_fd);
+
+    if (!error && existing_size + received != total_size)
+        error = 1;
 
     if (error) {
         send_error(fd, "Write error (partial file kept for resume)");

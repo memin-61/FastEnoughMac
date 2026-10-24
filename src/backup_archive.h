@@ -11,6 +11,7 @@ struct BackupArchiveEntry {
     uint64_t size = 0;
     uint64_t localHeaderOffset = 0;
     uint64_t dataOffset = 0;
+    int64_t mtime = 0;      // unix seconds, 0 = unknown
 };
 
 class BackupArchive {

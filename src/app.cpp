@@ -6,6 +6,7 @@
 #include "device_dokan.h"
 #ifdef __APPLE__
 #include "trash_macos.h"
+#include "dialog_macos.h"
 #endif
 #ifndef _WIN32
 #include "imgui_impl_opengl3.h"
@@ -93,7 +94,16 @@ inline int MultiByteToWideChar(int, int, const char* s, int slen, wchar_t* out, 
 #define MB_ICONQUESTION 0x20
 #define IDYES 6
 #define IDNO 7
-inline int MessageBoxA(void*, const char*, const char*, int){ return IDYES; }
+inline int MessageBoxA(void*, const char* text, const char* caption, int){
+#ifdef __APPLE__
+    // Previously returned IDYES unconditionally, so destructive confirmations
+    // (delete backup jobs, uninstall apps, restore over data) were auto-accepted.
+    extern bool macConfirmDialog(const char* title, const char* message);
+    return macConfirmDialog(caption ? caption : "Confirm", text ? text : "") ? IDYES : IDNO;
+#else
+    return IDYES;
+#endif
+}
 struct STARTUPINFOA { int cb; void* hStdOutput; void* hStdError; void* hStdInput; DWORD dwFlags; int wShowWindow; };
 struct PROCESS_INFORMATION { void* hProcess; void* hThread; DWORD dwProcessId; DWORD dwThreadId; };
 #define STARTF_USESHOWWINDOW 1
@@ -14411,6 +14421,7 @@ void App::processBatchQueue() {
                             if (sh.fileIndex == block.fileIndex) { fh = sh.handle; break; }
 
                         uint64_t blockReceived = 0;
+                        bool blockWriteFailed = false;
                         auto rangeCb = [&](const void* data, uint32_t len, uint64_t offset) -> bool {
                             if (m_shutdownTransfer || batch->stopRequested.load()) return false;
                             while (batch->pauseRequested.load() && !m_shutdownTransfer && !batch->stopRequested.load()) {
@@ -14424,8 +14435,14 @@ void App::processBatchQueue() {
                                 OVERLAPPED ov = {};
                                 ov.Offset = (DWORD)(offset & 0xFFFFFFFF);
                                 ov.OffsetHigh = (DWORD)(offset >> 32);
-                                DWORD written;
-                                WriteFile(fh, data, len, &written, &ov);
+                                DWORD written = 0;
+                                if (!WriteFile(fh, data, len, &written, &ov) || written != len) {
+                                    // Disk full / I/O error / revoked permission: abort the
+                                    // block so the file is retried or reported, never kept.
+                                    blockWriteFailed = true;
+                                    batch->errorMessage = "Local write failed for " + item.displayName;
+                                    return false;
+                                }
                             }
                             blockReceived += len;
                             updateProgress(blockReceived);
@@ -14433,7 +14450,7 @@ void App::processBatchQueue() {
                         };
 
                         uint64_t got = dev.readRangeStreaming(item.sourcePath, block.offset, block.length, rangeCb);
-                        ok = (got >= block.length) || batch->stopRequested.load();
+                        ok = !blockWriteFailed && ((got >= block.length) || batch->stopRequested.load());
                         if (ok && !batch->stopRequested.load()) {
                             std::lock_guard<std::mutex> lk(crcMutex);
                             allBlockCrcs.push_back({block.blockId, block.offset, ~blockCrc, block.length, block.fileIndex});
@@ -14450,7 +14467,8 @@ void App::processBatchQueue() {
                             uint32_t blockCrc = ~(uint32_t)0;
                             HANDLE hCrc = CreateFileW(toWide(item.sourcePath).c_str(), GENERIC_READ,
                                 FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-                            if (hCrc != INVALID_HANDLE_VALUE) {
+                            bool crcReadOk = (hCrc != INVALID_HANDLE_VALUE);
+                            if (crcReadOk) {
                                 LARGE_INTEGER seekPos; seekPos.QuadPart = (LONGLONG)block.offset;
                                 SetFilePointerEx(hCrc, seekPos, nullptr, FILE_BEGIN);
                                 char crcBuf[256 * 1024];
@@ -14458,13 +14476,23 @@ void App::processBatchQueue() {
                                 while (remaining > 0) {
                                     DWORD toRead = (DWORD)std::min(remaining, (uint64_t)sizeof(crcBuf));
                                     DWORD bytesRead = 0;
-                                    if (!ReadFile(hCrc, crcBuf, toRead, &bytesRead, nullptr) || bytesRead == 0) break;
+                                    if (!ReadFile(hCrc, crcBuf, toRead, &bytesRead, nullptr) || bytesRead == 0) {
+                                        // Short read / I/O error: the block CRC would describe
+                                        // only a prefix, producing a bogus "corrupted" verdict.
+                                        crcReadOk = false;
+                                        break;
+                                    }
                                     crc32Update(blockCrc, crcBuf, bytesRead);
                                     remaining -= bytesRead;
                                 }
                                 CloseHandle(hCrc);
+                            }
+                            if (crcReadOk) {
                                 std::lock_guard<std::mutex> lk(crcMutex);
                                 allBlockCrcs.push_back({block.blockId, block.offset, ~blockCrc, block.length, block.fileIndex});
+                            } else {
+                                LOG_WARN("Transfer", "Could not hash local block for " + item.displayName +
+                                         "; block excluded from CRC verification");
                             }
                         }
                     }
@@ -15833,7 +15861,11 @@ void App::processBatchQueue() {
                 try {
                     std::filesystem::create_directories(destDir);
                 } catch (...) {}
+#ifdef _WIN32
                 std::string testPath = pathToUtf8(destDir) + "\\.afm_write_test";
+#else
+                std::string testPath = (destDir / ".afm_write_test").string();
+#endif
                 HANDLE hTest = CreateFileW(toWide(testPath).c_str(), GENERIC_WRITE, 0, nullptr,
                                            CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
                 if (hTest == INVALID_HANDLE_VALUE) {
@@ -15845,7 +15877,11 @@ void App::processBatchQueue() {
                         batch->errorMessage = "Cannot write to: " + pathToUtf8(destDir) + " (error " + std::to_string(err) + ")";
                     break;
                 }
-                CloseHandle(hTest); // FILE_FLAG_DELETE_ON_CLOSE auto-deletes
+                // FILE_FLAG_DELETE_ON_CLOSE is not implemented by the POSIX shim,
+                // so remove the probe explicitly (and never leave it in a parent dir).
+                CloseHandle(hTest);
+                std::error_code probeEc;
+                std::filesystem::remove(toFsPath(testPath), probeEc);
 
                 // Also check if destination file specifically is read-only
                 if (std::filesystem::exists(toFsPath(item.destPath))) {
@@ -15981,8 +16017,23 @@ void App::processBatchQueue() {
                 bool ok = false;
                 try {
                     // Same-drive move: instant rename (no data copy)
-                    bool sameDrive = (item.sourcePath.size() >= 2 && item.destPath.size() >= 2 &&
-                                     toupper(item.sourcePath[0]) == toupper(item.destPath[0]));
+                    // Compare the actual device ids: the old first-character test is
+                    // always true on POSIX (both paths start with '/'), which made a
+                    // cross-volume Move fail with EXDEV.
+                    bool sameDrive = false;
+#ifdef _WIN32
+                    sameDrive = (item.sourcePath.size() >= 2 && item.destPath.size() >= 2 &&
+                                 toupper(item.sourcePath[0]) == toupper(item.destPath[0]));
+#else
+                    {
+                        struct stat sst {}, dst {};
+                        auto sp = toFsPath(item.sourcePath);
+                        auto dparent = toFsPath(item.destPath).parent_path();
+                        if (!dparent.empty() && stat(sp.c_str(), &sst) == 0 &&
+                            stat(dparent.c_str(), &dst) == 0)
+                            sameDrive = (sst.st_dev == dst.st_dev);
+                    }
+#endif
 
                     if (batch->isMove && sameDrive && !item.isDirectory) {
                         // Create parent directory if needed
@@ -16016,17 +16067,29 @@ void App::processBatchQueue() {
                         auto buf = std::make_unique<char[]>(bufSize);
                         uint64_t copied = 0;
                         bool cancelled = false;
+                        bool writeFailed = false;
                         while (true) {
                             size_t n = fread(buf.get(), 1, bufSize, fin);
                             if (n == 0) break;
-                            fwrite(buf.get(), 1, n, fout);
+                            if (fwrite(buf.get(), 1, n, fout) != n) { writeFailed = true; break; }
                             copied += n;
                             if (!progressCb(copied, item.fileSize)) { cancelled = true; break; }
                         }
+                        bool readFailed = ferror(fin) != 0;
                         fclose(fin);
-                        fclose(fout);
+                        // fclose flushes; a deferred ENOSPC surfaces here.
+                        if (fclose(fout) != 0) writeFailed = true;
                         if (cancelled) {
                             std::filesystem::remove(toFsPath(item.destPath));
+                        } else if (writeFailed || readFailed) {
+                            std::filesystem::remove(toFsPath(item.destPath));
+                            throw std::runtime_error(writeFailed
+                                ? "Write failed (disk full or I/O error): " + item.destPath
+                                : "Read failed: " + item.sourcePath);
+                        } else if (item.fileSize > 0 && copied != item.fileSize) {
+                            std::filesystem::remove(toFsPath(item.destPath));
+                            throw std::runtime_error("Copy incomplete: " + std::to_string(copied) +
+                                " of " + std::to_string(item.fileSize) + " bytes");
                         } else {
                             ok = true;
                             // Cross-drive move: delete source after successful copy
@@ -16514,8 +16577,20 @@ void App::processBatchQueue() {
                 batch->crcResults.push_back(std::move(crcRes));
 
                 if (!crcOk) {
-                    LOG_WARN("Transfer", "CRC failed for " + item.displayName + ": " + crcDetail + " — continuing batch");
-                    batch->errorMessage = "CRC failed: " + item.displayName + " — continuing...";
+                    // A failed verification means the destination bytes are not what the
+                    // source had. Fail the batch (mirrors the parallel path) instead of
+                    // reporting Completed and keeping a corrupt file.
+                    LOG_ERROR("Transfer", "CRC failed for " + item.displayName + ": " + crcDetail);
+                    batch->errorMessage = "CRC verification failed: " + item.displayName;
+                    batch->state = BatchState::Failed;
+                    try {
+                        if (batch->isPull || batch->isLocalCopy) {
+                            std::filesystem::remove(toFsPath(item.destPath));
+                        } else {
+                            batchDev.deleteFile(item.destPath);
+                        }
+                    } catch (...) {}
+                    break;
                 } else {
                     batch->errorMessage.clear();
                 }

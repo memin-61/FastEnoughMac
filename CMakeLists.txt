@@ -47,6 +47,7 @@ if(APPLE)
         src/mcraw_projfs_stub.cpp
         src/main_mac.cpp
         src/trash_macos.mm
+        src/dialog_macos.mm
     )
 else()
     list(APPEND APP_SOURCES
