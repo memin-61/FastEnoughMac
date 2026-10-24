@@ -121,9 +121,52 @@ inline DWORD GetLogicalDrives(){ return 0; }
 struct FILE_IO_PRIORITY_HINT_INFO { int PriorityHint; };
 #define FileIoPriorityHintInfo 0
 inline bool CloseHandle(HANDLE h){ if(h && h!=INVALID_HANDLE_VALUE) fclose((FILE*)h); return true; }
-inline HANDLE CreateFileW(const wchar_t* p,DWORD a,DWORD s,void*,DWORD d,DWORD at,void*){ (void)s;(void)at; std::string sp; for(auto c=p;c&&*c;c++) sp.push_back((char)*c); const char* m="rb"; if(a&GENERIC_WRITE) m=(d==CREATE_ALWAYS)?"wb":"r+b"; FILE* f=fopen(sp.c_str(),m); return f?(HANDLE)f:INVALID_HANDLE_VALUE; }
-inline bool ReadFile(HANDLE h,void* b,DWORD r,DWORD* n,void*){ if(!h||h==INVALID_HANDLE_VALUE) return false; size_t k=fread(b,1,r,(FILE*)h); if(n) *n=(DWORD)k; return k>0; }
-inline bool WriteFile(HANDLE h,const void* b,DWORD w,DWORD* n,void*){ if(!h||h==INVALID_HANDLE_VALUE) return false; size_t k=fwrite(b,1,w,(FILE*)h); if(n) *n=(DWORD)k; return k==w; }
+#ifndef OPEN_ALWAYS
+#define OPEN_ALWAYS 4
+#endif
+struct OVERLAPPED { void* hEvent; DWORD Offset; DWORD OffsetHigh; };
+
+inline HANDLE CreateFileW(const wchar_t* p,DWORD a,DWORD s,void*,DWORD d,DWORD at,void*){
+    (void)s;(void)at;
+    std::string sp; for(auto c=p;c&&*c;c++) sp.push_back((char)*c);
+    const char* m="rb";
+    if(a&GENERIC_WRITE) m=(d==CREATE_ALWAYS)?"wb":"r+b";
+    else if(d==OPEN_ALWAYS) m="a+b";
+    FILE* f=fopen(sp.c_str(),m);
+    if(!f && (a&GENERIC_WRITE)) f=fopen(sp.c_str(),"wb");
+    if(f) setvbuf(f, nullptr, _IONBF, 0);   // pwrite/pread are used; keep POSIX fd view authoritative
+    return f?(HANDLE)f:INVALID_HANDLE_VALUE;
+}
+// OVERLAPPED-aware positional I/O. On Win32 ReadFile/WriteFile honour the
+// OVERLAPPED offset; the previous shim silently ignored it and appended at the
+// shared FILE* position, which corrupted every multi-block (>200 MB) pull by
+// writing blocks in completion order after a sparse zero pre-allocation.
+static inline off_t afm_overlapped_offset(FILE* f, void* ovp) {
+    OVERLAPPED* ov = (OVERLAPPED*)ovp;
+    if (ov) return (off_t)(((uint64_t)ov->OffsetHigh << 32) | (uint64_t)ov->Offset);
+    off_t pos = ftello(f);
+    return pos < 0 ? (off_t)0 : pos;
+}
+inline bool ReadFile(HANDLE h,void* b,DWORD r,DWORD* n,void* ovp){
+    if(!h||h==INVALID_HANDLE_VALUE) return false;
+    FILE* f=(FILE*)h;
+    off_t off = afm_overlapped_offset(f, ovp);
+    ssize_t k = pread(fileno(f), b, (size_t)r, off);
+    if (k < 0) k = 0;
+    if (!ovp) fseeko(f, off + k, SEEK_SET);   // advance sequential position
+    if(n) *n=(DWORD)k;
+    return k > 0 || r == 0;
+}
+inline bool WriteFile(HANDLE h,const void* b,DWORD w,DWORD* n,void* ovp){
+    if(!h||h==INVALID_HANDLE_VALUE) return false;
+    FILE* f=(FILE*)h;
+    off_t off = afm_overlapped_offset(f, ovp);
+    ssize_t k = pwrite(fileno(f), b, (size_t)w, off);
+    if (k < 0) k = 0;
+    if (!ovp) fseeko(f, off + k, SEEK_SET);   // advance sequential position
+    if(n) *n=(DWORD)k;
+    return k == (ssize_t)w;
+}
 inline bool SetFileInformationByHandle(HANDLE,int,void*,DWORD){return true;}
 inline bool GetFileSizeEx(HANDLE h, void* sz){ if(!h||h==INVALID_HANDLE_VALUE) return false; long cur=ftell((FILE*)h); fseek((FILE*)h,0,SEEK_END); long s=ftell((FILE*)h); fseek((FILE*)h,cur,SEEK_SET); *(long long*)sz=s; return true; }
 struct LARGE_INTEGER { long long QuadPart; };
@@ -139,7 +182,7 @@ inline bool SetFilePointerEx(HANDLE h, LARGE_INTEGER li, void*, DWORD){ if(!h||h
 #define MAX_PATH 260
 inline int SHGetFolderPathA(void*, int, void*, DWORD, char* path){
     const char* home=getenv("HOME");
-    std::string dir=std::string(home?home:"/tmp")+"/Library/Application Support/FastEnough";
+    std::string dir=std::string(home?home:"/tmp")+"/Library/Application Support";
     std::filesystem::create_directories(dir);
     strncpy(path, dir.c_str(), MAX_PATH);
     return S_OK;
@@ -173,7 +216,6 @@ inline bool SetThreadInformation(void*, int, void*, size_t){ return true; }
 #define FILE_ATTRIBUTE_TEMPORARY 0x100
 #define FILE_FLAG_DELETE_ON_CLOSE 0x04000000
 #define ERROR_ACCESS_DENIED 5
-struct OVERLAPPED { void* hEvent; DWORD Offset; DWORD OffsetHigh; };
 inline int _wfopen_s(FILE** f, const wchar_t* path, const wchar_t* mode){
     std::string sp, sm;
     for(auto c=path;c&&*c;c++) sp.push_back((char)*c);
@@ -186,7 +228,12 @@ inline int _wfopen_s(FILE** f, const wchar_t* path, const wchar_t* mode){
 
 #define LONGLONG long long
 #define ULONGLONG unsigned long long
-inline bool SetEndOfFile(HANDLE h){ if(!h||h==INVALID_HANDLE_VALUE) return false; fflush((FILE*)h); long pos = ftell((FILE*)h); if(pos<0) return false; return ftruncate(fileno((FILE*)h), (off_t)pos)==0; }
+inline bool SetEndOfFile(HANDLE h){ if(!h||h==INVALID_HANDLE_VALUE) return false; off_t pos = ftello((FILE*)h); if(pos<0) return false; return ftruncate(fileno((FILE*)h), pos)==0; }
+// Pre-allocate an exact size without relying on the shared file position.
+inline bool afm_ftruncate_size(HANDLE h, uint64_t size){
+    if(!h||h==INVALID_HANDLE_VALUE) return false;
+    return ftruncate(fileno((FILE*)h), (off_t)size)==0;
+}
 inline bool FlushFileBuffers(HANDLE h){ if(!h||h==INVALID_HANDLE_VALUE) return false; return fflush((FILE*)h)==0; }
 inline DWORD GetCurrentProcessId(){ return (DWORD)getpid(); }
 inline unsigned long long GetTickCount64(){ return (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -1343,9 +1390,9 @@ static bool endsWithCI(const std::string& s, const std::string& suffix) {
 static std::string getPrefsPath() {
     char path[MAX_PATH];
     if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, path))) {
-        std::string dir = std::string(path) + "\\FastEnough";
+        std::string dir = (std::filesystem::path(path) / "FastEnough").string();
         CreateDirectoryA(dir.c_str(), nullptr);
-        return dir + "\\preferences.ini";
+        return (std::filesystem::path(dir) / "preferences.ini").string();
     }
     return "";
 }
@@ -1548,9 +1595,9 @@ void AppPreferences::load() {
 std::string AppTheme::getThemePath() {
     char path[MAX_PATH];
     if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, path))) {
-        std::string dir = std::string(path) + "\\FastEnough";
+        std::string dir = (std::filesystem::path(path) / "FastEnough").string();
         CreateDirectoryA(dir.c_str(), nullptr);
-        return dir + "\\theme.ini";
+        return (std::filesystem::path(dir) / "theme.ini").string();
     }
     return "";
 }
@@ -1619,6 +1666,28 @@ void AppTheme::load() {
     }
     if (!hasAdaptiveThemeSettings)
         customColors = false;
+}
+
+// CRC32 a completed local file from disk (not from the transfer stream).
+// Used to catch placement bugs where the received bytes were correct but were
+// written to the wrong offsets.
+static bool crc32LocalFileOnDisk(const std::string& path, uint32_t& outCrc, uint64_t& outSize, std::string& err) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { err = "cannot open local file: " + path + " (" + strerror(errno) + ")"; return false; }
+    uint32_t crc = 0xffffffffu;
+    std::vector<char> buf(4 * 1024 * 1024);
+    uint64_t total = 0;
+    size_t n;
+    while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) {
+        crc32Update(crc, buf.data(), n);
+        total += n;
+    }
+    bool bad = ferror(f) != 0;
+    fclose(f);
+    if (bad) { err = "read error while hashing " + path; return false; }
+    outCrc = crc;
+    outSize = total;
+    return true;
 }
 
 // Defined in main.cpp — for real quit (bypassing minimize-to-tray)
@@ -7072,7 +7141,14 @@ void App::startBackupManagerBackup() {
             if (!archiveCancelled && !transferFailed.load() && downloadedBytes.load() == remoteArchiveSize) {
                 downloadOk = verification.open(temporaryArchivePath, verifyError) &&
                     verification.find("job.json") != nullptr;
+                if (!downloadOk && verifyError.empty()) verifyError = "verification failed: job.json not found or zip invalid";
+                if (!downloadOk) LOG_ERROR("BackupManager", "Archive verification failed: " + verifyError);
             } else {
+                if (!archiveCancelled) {
+                    if (transferFailed.load()) verifyError = "transfer failed";
+                    else if (downloadedBytes.load() != remoteArchiveSize) verifyError = "incomplete download: " + std::to_string(downloadedBytes.load()) + " vs " + std::to_string(remoteArchiveSize);
+                    LOG_ERROR("BackupManager", "Archive download incomplete: " + verifyError);
+                }
                 downloadOk = false;
             }
             if (downloadOk) {
@@ -8843,7 +8919,11 @@ void App::openAndroidFile(FilePanel& panel, int index) {
     postAsync("Opening: " + name, [this, remotePath, name, slot]() {
         char tempBuf[MAX_PATH];
         GetTempPathA(MAX_PATH, tempBuf);
+#ifdef _WIN32
         std::string tempDir = std::string(tempBuf) + "FastEnough\\";
+#else
+        std::string tempDir = (std::filesystem::path(tempBuf) / "FastEnough").string() + "/";
+#endif
         CreateDirectoryA(tempDir.c_str(), nullptr);
 
         std::string localPath = tempDir + name;
@@ -13912,9 +13992,15 @@ void App::processBatchQueue() {
                         HANDLE h = CreateFileW(toWide(item.destPath).c_str(), GENERIC_WRITE, FILE_SHARE_WRITE, nullptr,
                                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
                         if (h != INVALID_HANDLE_VALUE) {
+#ifdef _WIN32
                             LARGE_INTEGER li; li.QuadPart = (LONGLONG)item.fileSize;
                             SetFilePointerEx(h, li, nullptr, FILE_BEGIN);
                             SetEndOfFile(h);
+#else
+                            // Explicit size truncation; never derive the size from the
+                            // stream position (that produced a 2x file with a zero head).
+                            ftruncate(fileno((FILE*)h), (off_t)item.fileSize);
+#endif
                             splitHandles.push_back({i, h, item.fileSize});
                         }
                     } else {
@@ -14601,6 +14687,91 @@ void App::processBatchQueue() {
             // Close all split file handles
             for (auto& sh : splitHandles) {
                 if (sh.handle != INVALID_HANDLE_VALUE) CloseHandle(sh.handle);
+            }
+
+            // --- Placement verification for split pulls ---
+            // A block-split pull pre-allocates the destination and then writes each
+            // block at its own offset. Verify that the finished file has exactly the
+            // expected size and that its bytes on disk hash to the CRC assembled from
+            // the received blocks. This is the check that would have caught the
+            // OVERLAPPED-offset shim bug (2x file, correct stream CRC).
+            if (batch->isPull && !splitHandles.empty() && !batch->stopRequested.load()) {
+                std::unordered_map<int, std::vector<BlockCrc*>> blocksByFile;
+                for (auto& bc : allBlockCrcs) blocksByFile[bc.fileIndex].push_back(&bc);
+
+                for (auto& sh : splitHandles) {
+                    int fi = sh.fileIndex;
+                    if (fi < 0 || fi >= batch->totalFiles()) continue;
+                    auto& item = batch->files[fi];
+                    if (item.isDirectory || item.isMcrawVirtual) continue;
+
+                    std::error_code sizEc;
+                    uint64_t actualSize = 0;
+                    auto fsz = std::filesystem::file_size(toFsPath(item.destPath), sizEc);
+                    if (!sizEc) actualSize = (uint64_t)fsz;
+
+                    if (sizEc) {
+                        batch->errorMessage = "Placement check failed: cannot stat " + item.displayName;
+                        LOG_ERROR("Transfer", batch->errorMessage + " (" + sizEc.message() + ")");
+                        batch->crcResults.push_back({item.displayName, false, batch->errorMessage,
+                                                     0, 0, 0, item.fileSize, item.sourcePath, item.destPath});
+                        continue;
+                    }
+                    if (actualSize != item.fileSize) {
+                        std::string msg = "Placement check failed: " + item.displayName +
+                            " size on disk " + std::to_string(actualSize) +
+                            " != expected " + std::to_string(item.fileSize);
+                        batch->errorMessage = msg;
+                        LOG_ERROR("Transfer", msg);
+                        TransferBatch::CrcResult r;
+                        r.fileName = item.displayName;
+                        r.passed = false;
+                        r.detail = "Size mismatch on disk: " + std::to_string(actualSize) +
+                                   " != " + std::to_string(item.fileSize);
+                        r.fileSize = item.fileSize;
+                        r.sourcePath = item.sourcePath;
+                        r.destPath = item.destPath;
+                        batch->crcResults.push_back(std::move(r));
+                        continue;
+                    }
+
+                    // Compare on-disk CRC against the CRC combined from received blocks.
+                    auto it = blocksByFile.find(fi);
+                    if (it == blocksByFile.end() || it->second.empty()) continue;
+                    auto& blocks = it->second;
+                    std::sort(blocks.begin(), blocks.end(),
+                              [](const BlockCrc* a, const BlockCrc* b) { return a->offset < b->offset; });
+                    uint32_t expected = blocks[0]->crc;
+                    for (size_t i = 1; i < blocks.size(); i++)
+                        expected = crc32Combine(expected, blocks[i]->crc, blocks[i]->length);
+
+                    uint32_t diskCrc = 0;
+                    uint64_t diskSize = 0;
+                    std::string diskErr;
+                    if (!crc32LocalFileOnDisk(item.destPath, diskCrc, diskSize, diskErr)) {
+                        LOG_ERROR("Transfer", "Placement check could not hash " + item.displayName + ": " + diskErr);
+                        continue;
+                    }
+                    if (diskCrc != expected) {
+                        std::string msg = "Placement check failed: " + item.displayName +
+                            " on-disk CRC " + std::to_string(diskCrc) +
+                            " != expected " + std::to_string(expected) +
+                            " (blocks may have been written out of order)";
+                        batch->errorMessage = msg;
+                        LOG_ERROR("Transfer", msg);
+                        TransferBatch::CrcResult r;
+                        r.fileName = item.displayName;
+                        r.passed = false;
+                        r.detail = "On-disk CRC mismatch (blocks written out of order)";
+                        r.fileSize = item.fileSize;
+                        r.sourcePath = item.sourcePath;
+                        r.destPath = item.destPath;
+                        batch->crcResults.push_back(std::move(r));
+                    } else {
+                        LOG_INFO("Transfer", "Placement check OK: " + item.displayName +
+                                 " (" + formatSize(diskSize) + ", " + std::to_string(blocks.size()) + " blocks)");
+                    }
+                }
             }
 
             // --- CRC verification for parallel transfers ---
