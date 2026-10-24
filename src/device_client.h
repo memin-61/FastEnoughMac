@@ -236,6 +236,9 @@ public:
     // Create/truncate a file on the device with optional pre-allocation
     bool createFile(const std::string& remotePath, uint64_t totalSize = 0);
 
+    // Apply a unix mtime to a remote path (best effort; ignored by older helpers).
+    bool setRemoteMtime(const std::string& remotePath, int64_t mtime);
+
     bool deleteFile(const std::string& path);
     bool createDirectory(const std::string& path);
     bool renameFile(const std::string& oldPath, const std::string& newPath);

@@ -757,6 +757,35 @@ static bool parse_zip64_values(const std::vector<unsigned char>& extra,
     return !(needSize || needCompressed || needOffset);
 }
 
+// Convert a DOS date/time pair back to unix seconds (0 when unset/invalid).
+static int64_t dos_to_unix(uint16_t dos_time, uint16_t dos_date) {
+    if (dos_date == 0) return 0;
+    struct tm tmv{};
+    tmv.tm_year = ((dos_date >> 9) & 0x7f) + 80;
+    tmv.tm_mon  = ((dos_date >> 5) & 0x0f) - 1;
+    tmv.tm_mday = (dos_date & 0x1f);
+    tmv.tm_hour = (dos_time >> 11) & 0x1f;
+    tmv.tm_min  = (dos_time >> 5) & 0x3f;
+    tmv.tm_sec  = (dos_time & 0x1f) * 2;
+    if (tmv.tm_mon < 0 || tmv.tm_mday <= 0) return 0;
+    tmv.tm_isdst = -1;
+    time_t tt = mktime(&tmv);
+    return tt < 0 ? 0 : (int64_t)tt;
+}
+
+// Write a DOS date/time pair (local time) for a unix timestamp.
+static void dos_datetime(int64_t unix_sec, uint16_t& dos_time, uint16_t& dos_date) {
+    if (unix_sec <= 0) { dos_time = 0; dos_date = 0x0021; return; } // 1980-01-01
+    time_t tt = (time_t)unix_sec;
+    struct tm tmv{};
+    localtime_r(&tt, &tmv);
+    int year = tmv.tm_year + 1900;
+    if (year < 1980) { dos_time = 0; dos_date = 0x0021; return; }
+    if (year > 2107) year = 2107;
+    dos_time = (uint16_t)((tmv.tm_hour << 11) | (tmv.tm_min << 5) | (tmv.tm_sec / 2));
+    dos_date = (uint16_t)(((year - 1980) << 9) | ((tmv.tm_mon + 1) << 5) | tmv.tm_mday);
+}
+
 static bool extract_store_zip(const std::string& archivePath, const std::string& destination, std::string& error) {
     int archive = open(archivePath.c_str(), O_RDONLY);
     if (archive < 0) {
@@ -913,6 +942,18 @@ static bool extract_store_zip(const std::string& archivePath, const std::string&
             copied += chunk;
         }
         close(output);
+        // Restore the stored modification time.
+        if (copyOk) {
+            uint16_t dTime = zip_u16(local + 10);
+            uint16_t dDate = zip_u16(local + 12);
+            int64_t mt = dos_to_unix(dTime, dDate);
+            if (mt > 0) {
+                struct timespec ts[2];
+                ts[0].tv_sec = (time_t)mt; ts[0].tv_nsec = 0;
+                ts[1] = ts[0];
+                utimensat(AT_FDCWD, outputPath.c_str(), ts, 0);
+            }
+        }
         if (!copyOk || (crc ^ 0xffffffffu) != expectedCrc) {
             error = copyOk ? "Archive entry failed its integrity check" : "Could not extract archive entry";
             close(archive);
@@ -959,6 +1000,7 @@ struct DeviceZipEntry {
     uint64_t size = 0;
     uint64_t localOffset = 0;
     uint32_t crc = 0;
+    int64_t mtime = 0;
 };
 
 static bool collect_zip_files(const std::string& root, const std::string& relative,
@@ -991,7 +1033,7 @@ static bool collect_zip_files(const std::string& root, const std::string& relati
                 error = "Backup contains an invalid archive path";
                 return false;
             }
-            files.push_back({diskPath, childRelative, (uint64_t)info.st_size, 0, 0});
+            files.push_back({diskPath, childRelative, (uint64_t)info.st_size, 0, 0, (int64_t)info.st_mtime});
         }
     }
     return true;
@@ -1009,8 +1051,10 @@ static bool create_store_zip(const std::string& sourceRoot, const std::string& a
     bool ok = true;
     for (auto& entry : files) {
         entry.localOffset = (uint64_t)lseek64(output, 0, SEEK_CUR);
+        uint16_t dosTime = 0, dosDate = 0;
+        dos_datetime(entry.mtime, dosTime, dosDate);
         ok = zip_write32(output, 0x04034b50) && zip_write16(output, 45) && zip_write16(output, 0x0800) &&
-            zip_write16(output, 0) && zip_write16(output, 0) && zip_write16(output, 0) && zip_write32(output, 0) &&
+            zip_write16(output, 0) && zip_write16(output, dosTime) && zip_write16(output, dosDate) && zip_write32(output, 0) &&
             zip_write32(output, 0xffffffffu) && zip_write32(output, 0xffffffffu) &&
             zip_write16(output, (uint16_t)entry.name.size()) && zip_write16(output, 20) &&
             write_fd_all(output, entry.name.data(), entry.name.size()) && zip_write16(output, 1) &&
@@ -1053,8 +1097,10 @@ static bool create_store_zip(const std::string& sourceRoot, const std::string& a
     uint64_t centralOffset = (uint64_t)lseek64(output, 0, SEEK_CUR);
     if (ok) {
         for (const auto& entry : files) {
+            uint16_t cTime = 0, cDate = 0;
+            dos_datetime(entry.mtime, cTime, cDate);
             ok = zip_write32(output, 0x02014b50) && zip_write16(output, 45) && zip_write16(output, 45) &&
-                zip_write16(output, 0x0800) && zip_write16(output, 0) && zip_write16(output, 0) && zip_write16(output, 0) &&
+                zip_write16(output, 0x0800) && zip_write16(output, 0) && zip_write16(output, cTime) && zip_write16(output, cDate) &&
                 zip_write32(output, entry.crc) && zip_write32(output, 0xffffffffu) && zip_write32(output, 0xffffffffu) &&
                 zip_write16(output, (uint16_t)entry.name.size()) && zip_write16(output, 28) && zip_write16(output, 0) &&
                 zip_write16(output, 0) && zip_write16(output, 0) && zip_write32(output, 0) && zip_write32(output, 0xffffffffu) &&
@@ -1178,7 +1224,8 @@ static void handle_create_backup_archive(int fd, const char* payload, uint32_t p
                 std::string name = slash == std::string::npos ? "base.apk" : source.substr(slash + 1);
                 if (!safe_relative_path(name) || name.find('/') != std::string::npos) name = "split" + std::to_string(apkIndex) + ".apk";
                 std::string copyOutput;
-                if (!run_command_output("cp -f " + quoted_shell(source) + " " + quoted_shell(appRoot + "/" + name), copyOutput)) {
+                // -p keeps the APK's original mtime so backups are date-accurate.
+                if (!run_command_output("cp -pf " + quoted_shell(source) + " " + quoted_shell(appRoot + "/" + name), copyOutput)) {
                     ok = false;
                     appOutput += copyOutput;
                     break;
@@ -2183,6 +2230,29 @@ static void handle_write_range(int fd, const void* payload, uint32_t payload_len
     }
 }
 
+// Apply a unix mtime to a path. Used after a transfer so dates survive.
+static void handle_set_mtime(int fd, const void* payload, uint32_t payload_len) {
+    if (payload_len < 8) { send_error(fd, "Invalid set-mtime"); return; }
+    int64_t mtime = 0;
+    memcpy(&mtime, payload, 8);
+    uint32_t path_len = payload_len - 8;
+    if (path_len == 0 || path_len >= PATH_MAX) { send_error(fd, "Invalid set-mtime path"); return; }
+    char pathbuf[PATH_MAX];
+    memcpy(pathbuf, (const char*)payload + 8, path_len);
+    pathbuf[path_len] = '\0';
+
+    struct timespec ts[2];
+    ts[0].tv_sec = (time_t)mtime; ts[0].tv_nsec = 0;
+    ts[1] = ts[0];
+    if (mtime <= 0) { send_ok(fd, NULL, 0); return; }
+    if (utimensat(AT_FDCWD, pathbuf, ts, 0) != 0) {
+        // Some filesystems refuse; report but do not treat as fatal upstream.
+        send_error(fd, strerror(errno));
+        return;
+    }
+    send_ok(fd, NULL, 0);
+}
+
 static void handle_create_file(int fd, const void* payload, uint32_t payload_len) {
     if (payload_len < 8) { send_error(fd, "Invalid create file"); return; }
 
@@ -2821,6 +2891,7 @@ static void handle_client(int client_fd) {
             case CMD_DISK_SPACE:    handle_disk_space(client_fd); break;
             case CMD_WRITE_RANGE:   handle_write_range(client_fd, payload_buf, hdr.length); break;
             case CMD_CREATE_FILE:   handle_create_file(client_fd, payload_buf, hdr.length); break;
+            case CMD_SET_MTIME:     handle_set_mtime(client_fd, payload_buf, hdr.length); break;
             case CMD_ARCHIVE_PATH:  handle_archive_path(client_fd, payload_buf, hdr.length); break;
             case CMD_EXTRACT_ARCHIVE: handle_extract_archive(client_fd, payload_buf, hdr.length); break;
             case CMD_INSTALL_BATCH: handle_install_batch(client_fd, payload_buf, hdr.length); break;

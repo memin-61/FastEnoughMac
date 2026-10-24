@@ -367,8 +367,22 @@ static NTSTATUS DOKAN_CALLBACK FsSetFileAttributes(
 static NTSTATUS DOKAN_CALLBACK FsSetFileTime(
     LPCWSTR FileName, CONST FILETIME* CreationTime,
     CONST FILETIME* LastAccessTime, CONST FILETIME* LastWriteTime,
-    PDOKAN_FILE_INFO) {
-    // Accept silently — we don't implement utime on device
+    PDOKAN_FILE_INFO DokanFileInfo) {
+    CTX;
+    // Windows FILETIME is 100ns ticks since 1601-01-01; CMD_SET_MTIME wants unix seconds.
+    const FILETIME* source = LastWriteTime ? LastWriteTime : CreationTime;
+    if (!source) source = LastAccessTime;
+    if (!source) return STATUS_SUCCESS;
+    ULARGE_INTEGER uli;
+    uli.LowPart = source->dwLowDateTime;
+    uli.HighPart = source->dwHighDateTime;
+    if (uli.QuadPart == 0) return STATUS_SUCCESS;
+    int64_t unixSeconds = (int64_t)(uli.QuadPart / 10000000ULL) - 11644473600LL;
+    if (unixSeconds <= 0) return STATUS_SUCCESS;
+
+    std::string devPath = toDevicePath(FileName, ctx);
+    ctx.device->setRemoteMtime(devPath, unixSeconds);
+    LOG_INFO("Dokan", "SetFileTime: " + devPath + " -> " + std::to_string(unixSeconds));
     return STATUS_SUCCESS;
 }
 

@@ -107,6 +107,7 @@ struct BatchFileItem {
     std::string destPath;
     std::string displayName;
     uint64_t fileSize = 0;
+    int64_t mtime = 0;          // unix seconds; 0 = unknown, leave OS-assigned
     bool isDirectory = false;
 
     // MCRAW virtual item fields

@@ -3880,6 +3880,25 @@ bool DeviceClient::createFile(const std::string& remotePath, uint64_t totalSize)
     return hdr.cmd == RSP_OK;
 }
 
+bool DeviceClient::setRemoteMtime(const std::string& remotePath, int64_t mtime) {
+    if (mtime <= 0) return true;
+    if (!m_connected) return false;
+    // Best effort: use the control channel so a slow transfer is not blocked.
+    std::vector<char> payload(8 + remotePath.size());
+    memcpy(payload.data(), &mtime, 8);
+    memcpy(payload.data() + 8, remotePath.data(), remotePath.size());
+
+    MsgHeader hdr{};
+    std::vector<char> resp;
+    if (!runSmallOp(CMD_SET_MTIME, payload.data(), (uint32_t)payload.size(), hdr, resp))
+        return false;
+    if (hdr.cmd != RSP_OK) {
+        // Older helpers do not know CMD_SET_MTIME; that is not a transfer failure.
+        return false;
+    }
+    return true;
+}
+
 uint64_t DeviceClient::readRange(const std::string& remotePath, uint64_t offset, uint64_t length,
                                  void* outBuffer) {
     if (!m_connected) { m_lastError = "Not connected"; return 0; }

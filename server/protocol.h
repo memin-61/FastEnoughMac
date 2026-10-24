@@ -37,6 +37,7 @@ enum {
     CMD_INSTALL_BATCH = 23, // payload: JSON manifest of staged APK groups
     CMD_RESTORE_BACKUP_ARCHIVE = 24, // payload: JSON restore manifest for a staged ZIP64 store archive
     CMD_CREATE_BACKUP_ARCHIVE = 25, // payload: JSON app selection, returns a device-local ZIP64 store archive
+    CMD_SET_MTIME   = 26, // payload: [8B unix mtime][path string] - apply mtime after a transfer
 };
 
 // Responses (server -> client)

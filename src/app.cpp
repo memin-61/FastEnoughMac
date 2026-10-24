@@ -33,6 +33,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <netdb.h>
 #include <net/if.h>
@@ -1666,6 +1667,38 @@ void AppTheme::load() {
     }
     if (!hasAdaptiveThemeSettings)
         customColors = false;
+}
+
+// Timestamp preservation ------------------------------------------------
+// Read a local file's mtime as unix seconds (0 when unavailable).
+static int64_t localMtimeOf(const std::string& path) {
+    std::error_code ec;
+    auto ft = std::filesystem::last_write_time(toFsPath(path), ec);
+    if (ec) return 0;
+    auto sc = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+        ft - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
+    return (int64_t)std::chrono::system_clock::to_time_t(sc);
+}
+
+// Apply a unix mtime to a finished local file.
+static bool applyLocalMtime(const std::string& path, int64_t mtime) {
+    if (mtime <= 0) return true;
+#ifdef _WIN32
+    HANDLE h = CreateFileW(toWide(path).c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    ULARGE_INTEGER uli;
+    uli.QuadPart = ((uint64_t)mtime + 11644473600ULL) * 10000000ULL;
+    FILETIME ft; ft.dwLowDateTime = uli.LowPart; ft.dwHighDateTime = uli.HighPart;
+    bool ok = SetFileTime(h, &ft, &ft, &ft) != 0;
+    CloseHandle(h);
+    return ok;
+#else
+    struct timespec ts[2];
+    ts[0].tv_sec = (time_t)mtime; ts[0].tv_nsec = 0;
+    ts[1] = ts[0];
+    return utimensat(AT_FDCWD, toFsPath(path).c_str(), ts, 0) == 0;
+#endif
 }
 
 // CRC32 a completed local file from disk (not from the transfer stream).
@@ -12960,6 +12993,7 @@ static void addPullDirRecursive(DeviceClient& dev, const std::string& srcDir, co
         sub.displayName = e.name;
         sub.isDirectory = e.isDirectory();
         sub.fileSize = e.size;
+        sub.mtime = e.mtime;
         sub.sourcePath = srcDir + "/" + e.name;
         sub.destPath = dstDir + PC_PATH_SEP + e.name;
         totalBytes += sub.fileSize;
@@ -12985,6 +13019,7 @@ static void addPushDirRecursive(const std::string& srcDir, const std::string& ds
         if (ec) sub.isDirectory = false;
         sub.sourcePath = pathToUtf8(entry.path());
         sub.destPath = dstDir + "/" + sub.displayName;
+        sub.mtime = localMtimeOf(sub.sourcePath);
         if (!sub.isDirectory) {
             sub.fileSize = (uint64_t)entry.file_size(ec);
             if (ec) sub.fileSize = 0;
@@ -13005,6 +13040,13 @@ static void buildBatchItems(FilePanel& srcPanel, FilePanel& dstPanel, bool isPul
         item.displayName = srcPanel.entryName(idx);
         item.isDirectory = srcPanel.entryIsDir(idx);
         item.fileSize = srcPanel.entrySize(idx);
+        if (srcPanel.isAndroid) {
+            if (idx >= 0 && idx < (int)srcPanel.androidEntries.size())
+                item.mtime = srcPanel.androidEntries[idx].mtime;
+        } else {
+            item.mtime = localMtimeOf(pathToUtf8(
+                toFsPath(srcPanel.currentPath) / srcPanel.entryName(idx)));
+        }
 
         // MCRAW virtual item
         if (srcPanel.insideMcraw) {
@@ -13068,6 +13110,7 @@ static void addCrossDeviceDirRecursive(DeviceClient& srcDev, const std::string& 
         sub.displayName = e.name;
         sub.isDirectory = e.isDirectory();
         sub.fileSize = e.size;
+        sub.mtime = e.mtime;
         sub.sourcePath = srcDir + "/" + e.name;
         sub.destPath = dstDir + "/" + e.name;
         totalBytes += sub.fileSize;
@@ -13086,6 +13129,8 @@ static void buildCrossDeviceBatchItems(FilePanel& srcPanel, FilePanel& dstPanel,
         item.displayName = srcPanel.entryName(idx);
         item.isDirectory = srcPanel.entryIsDir(idx);
         item.fileSize = srcPanel.entrySize(idx);
+        if (idx >= 0 && idx < (int)srcPanel.androidEntries.size())
+            item.mtime = srcPanel.androidEntries[idx].mtime;
 
         // Both source and dest are Android — use forward slashes
         std::string sp = srcPanel.currentPath;
@@ -14343,6 +14388,8 @@ void App::processBatchQueue() {
                                 if (ok && !batch->stopRequested.load()) {
                                     std::lock_guard<std::mutex> lk(crcMutex);
                                     wholeFileCrcs[item.destPath] = dev.getInlineCrc();
+                                    // Preserve the source timestamp on the local copy.
+                                    applyLocalMtime(item.destPath, item.mtime);
                                 }
                             }
                         } else {
@@ -14351,6 +14398,9 @@ void App::processBatchQueue() {
                             if (ok && !batch->stopRequested.load()) {
                                 std::lock_guard<std::mutex> lk(crcMutex);
                                 wholeFileCrcs[item.sourcePath] = dev.getInlineCrc();
+                                // Preserve the local timestamp on the device copy.
+                                int64_t mt = item.mtime ? item.mtime : localMtimeOf(item.sourcePath);
+                                dev.setRemoteMtime(item.destPath, mt);
                             }
                         }
                     } else if (batch->isPull) {
@@ -14687,6 +14737,21 @@ void App::processBatchQueue() {
             // Close all split file handles
             for (auto& sh : splitHandles) {
                 if (sh.handle != INVALID_HANDLE_VALUE) CloseHandle(sh.handle);
+            }
+
+            // Preserve source timestamps on completed split transfers.
+            if (!batch->stopRequested.load()) {
+                for (auto& sh : splitHandles) {
+                    if (sh.fileIndex < 0 || sh.fileIndex >= batch->totalFiles()) continue;
+                    auto& it = batch->files[sh.fileIndex];
+                    if (it.isDirectory || it.isMcrawVirtual) continue;
+                    if (batch->isPull) {
+                        applyLocalMtime(it.destPath, it.mtime);
+                    } else {
+                        int64_t mt = it.mtime ? it.mtime : localMtimeOf(it.sourcePath);
+                        batchDev.setRemoteMtime(it.destPath, mt);
+                    }
+                }
             }
 
             // --- Placement verification for split pulls ---
