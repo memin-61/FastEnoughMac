@@ -786,7 +786,8 @@ static void dos_datetime(int64_t unix_sec, uint16_t& dos_time, uint16_t& dos_dat
     dos_date = (uint16_t)(((year - 1980) << 9) | ((tmv.tm_mon + 1) << 5) | tmv.tm_mday);
 }
 
-static bool extract_store_zip(const std::string& archivePath, const std::string& destination, std::string& error) {
+static bool extract_store_zip_filtered(const std::string& archivePath, const std::string& destination,
+                                       const std::string& onlyPrefix, std::string& error) {
     int archive = open(archivePath.c_str(), O_RDONLY);
     if (archive < 0) {
         error = strerror(errno);
@@ -849,7 +850,10 @@ static bool extract_store_zip(const std::string& archivePath, const std::string&
     }
 
     std::string setupOutput;
-    if (!run_command_output("rm -rf " + quoted_shell(destination) + " && mkdir -p " + quoted_shell(destination), setupOutput)) {
+    std::string setupCmd = onlyPrefix.empty()
+        ? ("rm -rf " + quoted_shell(destination) + " && mkdir -p " + quoted_shell(destination))
+        : ("mkdir -p " + quoted_shell(destination));
+    if (!run_command_output(setupCmd, setupOutput)) {
         error = setupOutput.empty() ? "Could not create restore staging directory" : setupOutput;
         close(archive);
         return false;
@@ -905,6 +909,13 @@ static bool extract_store_zip(const std::string& archivePath, const std::string&
             error = "Archive entry exceeds file size";
             close(archive);
             return false;
+        }
+        if (!onlyPrefix.empty()) {
+            // Extract a single app's entries only (keeps peak disk usage low).
+            const std::string withSlash = onlyPrefix + "/";
+            if (name.compare(0, withSlash.size(), withSlash) != 0) {
+                continue;
+            }
         }
         std::string outputPath = destination + "/" + name;
         if (!make_parent_directories(outputPath)) {
@@ -962,6 +973,10 @@ static bool extract_store_zip(const std::string& archivePath, const std::string&
     }
     close(archive);
     return true;
+}
+
+static bool extract_store_zip(const std::string& archivePath, const std::string& destination, std::string& error) {
+    return extract_store_zip_filtered(archivePath, destination, std::string(), error);
 }
 
 static bool write_fd_all(int fd, const void* data, size_t length) {
@@ -1373,11 +1388,33 @@ static void handle_restore_backup_archive(int fd, const char* payload, uint32_t 
     }
     std::string staging = "/data/local/tmp/afm-restore-extracted-" + std::to_string(getpid()) + "-" +
         std::to_string((unsigned long long)time(nullptr));
-    std::string extractError;
-    if (!extract_store_zip(archive, staging, extractError)) {
-        unlink(archive.c_str());
-        send_error(fd, extractError.c_str());
-        return;
+    // Extract per app instead of the whole archive: the old flow duplicated the
+    // entire archive on device (archive + full extraction + tar expansion), which
+    // ran a 48 GB backup out of space and made the tail of the restore fail with
+    // tar/ENOSPC errors.
+    {
+        std::string setupOutput;
+        if (!run_command_output("mkdir -p " + quoted_shell(staging), setupOutput)) {
+            unlink(archive.c_str());
+            send_error(fd, setupOutput.empty() ? "Could not create restore staging directory" : setupOutput.c_str());
+            return;
+        }
+    }
+    // Fail fast with a clear message instead of dying mid-restore.
+    {
+        struct statvfs svfs{};
+        struct stat archiveInfo{};
+        if (stat(archive.c_str(), &archiveInfo) == 0 && statvfs("/data", &svfs) == 0) {
+            uint64_t freeBytes = (uint64_t)svfs.f_bavail * svfs.f_frsize;
+            uint64_t needBytes = (uint64_t)archiveInfo.st_size + (2ull << 30);
+            if (freeBytes < needBytes) {
+                unlink(archive.c_str());
+                std::string msg = "Not enough free space to restore: need about " +
+                    std::to_string(needBytes >> 20) + " MB, have " + std::to_string(freeBytes >> 20) + " MB";
+                send_error(fd, msg.c_str());
+                return;
+            }
+        }
     }
     uint32_t appCount = (uint32_t)request["apps"].size();
     if (send_ok(fd, &appCount, sizeof(appCount)) < 0) return;
@@ -1433,6 +1470,18 @@ static void handle_restore_backup_archive(int fd, const char* payload, uint32_t 
             RestoreTask& task = tasks[index];
             const std::string packageName = task.metadata.value("packageName", "");
             const std::string appRoot = staging + "/" + task.prefix;
+
+            std::string appExtractError;
+            if (!extract_store_zip_filtered(archive, staging, task.prefix, appExtractError)) {
+                task.success = false;
+                task.output += "Could not extract app files: " +
+                    (appExtractError.empty() ? std::string("unknown error") : appExtractError) + "\n";
+                completed.fetch_add(1);
+                sendEvent(index, "complete", "Restore failed", 1.0f);
+                std::string ignoredCleanup;
+                run_command_output("rm -rf " + quoted_shell(appRoot), ignoredCleanup);
+                continue;
+            }
             const auto has = task.metadata.value("has", nlohmann::json::object());
             bool ok = true;
             sendEvent(index, "restoring", "Installing APK", 0.10f);
@@ -1471,10 +1520,13 @@ static void handle_restore_backup_archive(int fd, const char* payload, uint32_t 
                 ownerOutput.erase(std::remove(ownerOutput.begin(), ownerOutput.end(), '\r'), ownerOutput.end());
                 if (ownerOutput.empty() || ownerOutput.find_first_not_of("0123456789:") != std::string::npos ||
                     ownerOutput.find(':') == std::string::npos) hadOwner = false;
+                // tar exits 1 for recoverable warnings (utime on read-only dirs,
+                // ignored headers); only >=2 is a real failure.
                 std::string command = "mkdir -p " + quoted_shell(target) +
                     " && rm -rf " + quoted_shell(target) + "/* " + quoted_shell(target) + "/.[!.]* " +
-                    quoted_shell(target) + "/..?* 2>/dev/null || true; tar -xpf " + quoted_shell(archiveFile) +
-                    " -C " + quoted_shell(target);
+                    quoted_shell(target) + "/..?* 2>/dev/null || true; "
+                    "tar -xpf " + quoted_shell(archiveFile) + " -C " + quoted_shell(target) +
+                    " 2>&1; __rc=$?; if [ $__rc -le 1 ]; then exit 0; else exit $__rc; fi";
                 std::string restoreOutput;
                 if (!run_command_output(command, restoreOutput)) {
                     task.output += restoreOutput;
@@ -1511,6 +1563,12 @@ static void handle_restore_backup_archive(int fd, const char* payload, uint32_t 
             task.success = ok;
             completed.fetch_add(1);
             sendEvent(index, "complete", ok ? "App restored" : "Restore failed", 1.0f);
+            // Release this app's extracted files immediately so peak disk usage
+            // stays at (archive + one app) instead of (archive + whole tree).
+            {
+                std::string ignoredCleanup;
+                run_command_output("rm -rf " + quoted_shell(appRoot), ignoredCleanup);
+            }
         }
     };
 
