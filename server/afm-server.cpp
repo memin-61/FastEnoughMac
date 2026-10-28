@@ -1501,14 +1501,28 @@ static void handle_restore_backup_archive(int fd, const char* payload, uint32_t 
                 run_command_output("am force-stop --user 0 " + quoted_shell(packageName), ignored);
             }
 
-            auto restoreTar = [&](const char* filename, const std::string& target, bool enabled, bool present) {
-                if (!ok || !enabled || !present) return;
+            // Each part restores independently: one failing part (e.g. data.tar
+            // running out of space) must not stop the remaining ones, and the
+            // result must name exactly which part failed.
+            auto restoreTar = [&](const char* label, const char* filename, const std::string& target,
+                                  bool enabled, bool present) -> bool {
+                if (!enabled || !present) return true;
                 std::string archiveFile = appRoot + "/" + filename;
                 struct stat archiveInfo{};
                 if (stat(archiveFile.c_str(), &archiveInfo) != 0 || !S_ISREG(archiveInfo.st_mode)) {
-                    task.output += std::string(filename) + " is missing\n";
-                    ok = false;
-                    return;
+                    task.output += std::string(label) + ": backup file " + filename + " is missing\n";
+                    return false;
+                }
+                struct statvfs svfs{};
+                if (statvfs("/data", &svfs) == 0 && strcmp(filename, "external.tar") != 0 &&
+                    strcmp(filename, "obb.tar") != 0 && strcmp(filename, "media.tar") != 0) {
+                    uint64_t freeBytes = (uint64_t)svfs.f_bavail * svfs.f_frsize;
+                    if (freeBytes < archiveInfo.st_size) {
+                        task.output += std::string(label) + ": not enough free space (need " +
+                            std::to_string(archiveInfo.st_size >> 20) + " MB, have " +
+                            std::to_string(freeBytes >> 20) + " MB)\n";
+                        return false;
+                    }
                 }
                 std::string ownerOutput;
                 bool hadOwner = run_command_output("stat -c '%u:%g' " + quoted_shell(target) + " 2>/dev/null", ownerOutput);
@@ -1525,23 +1539,42 @@ static void handle_restore_backup_archive(int fd, const char* payload, uint32_t 
                     " 2>&1; __rc=$?; if [ $__rc -le 1 ]; then exit 0; else exit $__rc; fi";
                 std::string restoreOutput;
                 if (!run_command_output(command, restoreOutput)) {
-                    task.output += restoreOutput;
-                    ok = false;
-                    return;
+                    task.output += std::string(label) + ": " + restoreOutput;
+                    if (restoreOutput.find("No space left") != std::string::npos)
+                        task.output += std::string(label) + ": device ran out of space\n";
+                    return false;
                 }
                 if (hadOwner) {
                     std::string fixOutput;
                     run_command_output("chown -R " + ownerOutput + " " + quoted_shell(target) +
                         "; restorecon -RF " + quoted_shell(target) + " >/dev/null 2>&1 || true", fixOutput);
                 }
+                return true;
             };
 
             sendEvent(index, "restoring", "Restoring app data", 0.45f);
-            restoreTar("data.tar", "/data/data/" + packageName, includeData, has.value("data", false));
-            restoreTar("data_de.tar", "/data/user_de/0/" + packageName, includeDe, has.value("data_de", false));
-            restoreTar("external.tar", "/sdcard/Android/data/" + packageName, includeExternal, has.value("external", false));
-            restoreTar("obb.tar", "/sdcard/Android/obb/" + packageName, includeObb, has.value("obb", false));
-            restoreTar("media.tar", "/sdcard/Android/media/" + packageName, includeMedia, has.value("media", false));
+            const bool apkRequired = includeApk && has.value("apk", false);
+            if (apkRequired && !ok) {
+                // Do not create a data directory for an app that is not installed:
+                // it would be root-owned and would shadow a later install.
+                task.output += "Skipped data restore because the APK could not be installed\n";
+                completed.fetch_add(1);
+                sendEvent(index, "complete", "Restore failed", 1.0f);
+                std::string ignoredCleanup;
+                run_command_output("rm -rf " + quoted_shell(appRoot), ignoredCleanup);
+                continue;
+            }
+            bool dataOk = restoreTar("App data", "data.tar", "/data/data/" + packageName,
+                                     includeData, has.value("data", false));
+            bool dataDeOk = restoreTar("Device-protected data", "data_de.tar",
+                                       "/data/user_de/0/" + packageName, includeDe, has.value("data_de", false));
+            bool externalOk = restoreTar("External data", "external.tar",
+                                         "/sdcard/Android/data/" + packageName, includeExternal, has.value("external", false));
+            bool obbOk = restoreTar("OBB data", "obb.tar", "/sdcard/Android/obb/" + packageName,
+                                    includeObb, has.value("obb", false));
+            bool mediaOk = restoreTar("Media", "media.tar", "/sdcard/Android/media/" + packageName,
+                                      includeMedia, has.value("media", false));
+            if (!(dataOk && dataDeOk && externalOk && obbOk && mediaOk)) ok = false;
 
             sendEvent(index, "restoring", "Restoring permissions", 0.90f);
             if (ok && grantPermissions && task.metadata.contains("permissions")) {

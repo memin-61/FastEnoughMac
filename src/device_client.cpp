@@ -1392,7 +1392,11 @@ bool DeviceClient::restoreStagedBackupArchive(const std::string& remoteArchive,
         if (state == "complete") {
             restored[index] = event.value("success", false);
             if (!restored[index]) {
-                output += friendlyRestoreFailure(event.value("output", ""), restoreAppNames[index],
+                const std::string raw = event.value("output", "");
+                LOG_ERROR("BackupManager", "Restore failed for " +
+                    (restorePackageNames[index].empty() ? std::string("<unknown>") : restorePackageNames[index]) +
+                    ": " + sanitizeAdbOutput(raw));
+                output += friendlyRestoreFailure(raw, restoreAppNames[index],
                     restorePackageNames[index], options.allowDowngrade) + "\n\n";
             }
         }
