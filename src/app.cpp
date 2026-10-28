@@ -1728,7 +1728,9 @@ static bool crc32LocalFileOnDisk(const std::string& path, uint32_t& outCrc, uint
     bool bad = ferror(f) != 0;
     fclose(f);
     if (bad) { err = "read error while hashing " + path; return false; }
-    outCrc = crc;
+    // Stored/combined CRCs use the standard (post-complement) form; the
+    // accumulator above is the raw pre-complement value.
+    outCrc = ~crc;
     outSize = total;
     return true;
 }
