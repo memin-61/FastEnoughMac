@@ -975,10 +975,6 @@ static bool extract_store_zip_filtered(const std::string& archivePath, const std
     return true;
 }
 
-static bool extract_store_zip(const std::string& archivePath, const std::string& destination, std::string& error) {
-    return extract_store_zip_filtered(archivePath, destination, std::string(), error);
-}
-
 static bool write_fd_all(int fd, const void* data, size_t length) {
     const unsigned char* value = (const unsigned char*)data;
     while (length > 0) {
